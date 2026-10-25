@@ -1,0 +1,15 @@
+{
+  "runtime_os": "Linux",
+  "runtime_architecture": "x86_64",
+  "runtime_python": "3.13.5",
+  "real_apple_silicon_macos": false,
+  "offline_tests": "PASS",
+  "simulated_account_usd": 1000,
+  "simulated_per_trade_max_risk_usd": 50,
+  "backtest_final_balance_usd": 1086.56,
+  "backtest_trades": 1,
+  "dataset_sha256": "e07fafd3d01f420653de5216ce4314b31d6c215a74077ca76d679fe6f84f31f7",
+  "mt5_terminal_connection": "NOT_TESTED",
+  "live_order_execution": "NOT_TESTED",
+  "macbook_battery_runtime": "NOT_TESTED"
+}

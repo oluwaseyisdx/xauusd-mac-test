@@ -1,0 +1,59 @@
+name: Gold SR - Real Apple Silicon M1 verification
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gold-on-mac:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Python 3.12 ARM64
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check real Apple Silicon macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+          python3 -c 'import platform; print(platform.platform(), platform.machine())'
+      - name: Execute gold support and resistance unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Run October 2026 gold historical simulation
+        run: python run.py
+      - name: Compare all results against original reference
+        run: python mac_verify.py --require-apple-silicon
+      - name: Attempt third-party MT5 Python bridge import (NOT terminal connection)
+        id: bridge
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-input 'mt5_mac==0.3.0'
+          python mt5_bridge_import_smoke.py
+      - name: Clearly label what was NOT tested
+        if: always()
+        shell: bash
+        run: |
+          echo '## Mac test scope' >> "$GITHUB_STEP_SUMMARY"
+          echo '- macOS offline Python strategy: see tests and mac_verification.json' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Third-party MT5 bridge import step: ${{ steps.bridge.outcome }}' >> "$GITHUB_STEP_SUMMARY"
+          echo '- **NOT TESTED:** Wine MT5 terminal startup, broker login, real-time quotes, order submission, duplicate-order protection and MacBook battery runtime.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload actual Mac results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: REAL_MAC_RESULTS
+          path: |
+            backtest_result.json
+            mac_verification.json
+            mt5_bridge_import_result.json
+          if-no-files-found: warn

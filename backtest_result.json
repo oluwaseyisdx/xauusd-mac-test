@@ -1,0 +1,169 @@
+{
+  "period_start": "2026-10-01",
+  "period_end": "2026-10-23",
+  "initial_balance_usd": 1000.0,
+  "ending_balance_usd": 1086.56,
+  "net_pnl_usd": 86.56,
+  "return_pct": 8.66,
+  "risk_cap_usd": 50.0,
+  "max_daily_close_drawdown_pct": -1.24,
+  "signal_count": 4,
+  "trades": 1,
+  "wins": 1,
+  "win_rate_pct": 100.0,
+  "signals": [
+    {
+      "date": "2026-10-09",
+      "side": "LONG",
+      "stop": 4140.3
+    },
+    {
+      "date": "2026-10-14",
+      "side": "SHORT",
+      "stop": 4171.22
+    },
+    {
+      "date": "2026-10-20",
+      "side": "SHORT",
+      "stop": 4156.29
+    },
+    {
+      "date": "2026-10-22",
+      "side": "SHORT",
+      "stop": 4126.92
+    }
+  ],
+  "skipped_signals": [
+    {
+      "date": "2026-10-11",
+      "side": "LONG",
+      "reason": "minimum lot risks >5%",
+      "minimum_lot_risk_usd": 54.29
+    },
+    {
+      "date": "2026-10-15",
+      "side": "SHORT",
+      "reason": "minimum lot risks >5%",
+      "minimum_lot_risk_usd": 60.55
+    },
+    {
+      "date": "2026-10-23",
+      "side": "SHORT",
+      "reason": "minimum lot risks >5%",
+      "minimum_lot_risk_usd": 104.5
+    }
+  ],
+  "trade_log": [
+    {
+      "side": "SHORT",
+      "entry_date": "2026-10-21",
+      "signal_date": "2026-10-20",
+      "entry": 4113.26,
+      "stop": 4156.29,
+      "target": 4026.2000000000007,
+      "lot": 0.01,
+      "planned_risk_usd": 43.529999999999745,
+      "risk_budget_usd": 50.0,
+      "exit_date": "2026-10-22",
+      "exit": 4026.7,
+      "pnl_usd": 86.56,
+      "reason": "TARGET",
+      "balance_after": 1086.56
+    }
+  ],
+  "equity_curve": [
+    {
+      "date": "2026-10-01",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-02",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-04",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-05",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-06",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-07",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-08",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-09",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-11",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-12",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-13",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-14",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-15",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-16",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-18",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-19",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-20",
+      "equity_usd": 1000.0
+    },
+    {
+      "date": "2026-10-21",
+      "equity_usd": 987.61
+    },
+    {
+      "date": "2026-10-22",
+      "equity_usd": 1086.56
+    },
+    {
+      "date": "2026-10-23",
+      "equity_usd": 1086.56
+    }
+  ],
+  "assumptions": {
+    "signal": "close break of previous 3 daily bar highs/lows",
+    "entry": "next bar open",
+    "stop": "signal-bar low/high +/- $1 per ounce",
+    "target": "2x planned stop loss distance",
+    "trading_costs": "$0.50/oz adverse on entry AND exit",
+    "lot_min": 0.01,
+    "lot_step": 0.01,
+    "contract_oz_per_lot": 100.0,
+    "gap_rule": "gap stop exit at worse opening price",
+    "same_bar_conflict": "stop first",
+    "capital_and_margin": "simulated PnL, no broker margin/swap validated"
+  }
+}
