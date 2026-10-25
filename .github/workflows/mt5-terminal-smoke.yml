@@ -1,0 +1,89 @@
+name: MT5 terminal + Python bridge on Apple Silicon (NO TRADES)
+
+on:
+  push:
+    paths:
+      - .github/workflows/mt5-terminal-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mt5-terminal-smoke:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Confirm genuine ARM64 macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sw_vers
+          uname -m
+
+      - name: Install Rosetta if necessary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+
+      - name: Download and install official MetaTrader 5 macOS package
+        shell: bash
+        timeout-minutes: 14
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mt5pkg"
+          curl --fail --location --show-error --silent --retry 2 --connect-timeout 20 --max-time 240 \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            --output "$RUNNER_TEMP/MetaTrader5.pkg.zip"
+          ditto -x -k "$RUNNER_TEMP/MetaTrader5.pkg.zip" "$RUNNER_TEMP/mt5pkg"
+          pkg="$(find "$RUNNER_TEMP/mt5pkg" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          test -d '/Applications/MetaTrader 5.app'
+          echo 'MT5.app installed successfully.'
+          open -a 'MetaTrader 5' || true
+          sleep 12
+
+      - name: Set up native Apple Silicon Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install native Python bridge
+        run: python -m pip install --disable-pip-version-check --no-input 'mt5_mac==0.3.0'
+
+      - name: Read-only terminal handshake and optional Gold quote
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          script = '''
+          import json, mt5_mac as mt5
+          result = {'bridge_import':'PASS','terminal_initialized':False,'account_session':False,'XAUUSD_quote':False,'orders_sent':0}
+          try:
+              result['terminal_initialized'] = bool(mt5.initialize())
+              if result['terminal_initialized']:
+                  result['account_session'] = mt5.account_info() is not None
+                  result['XAUUSD_quote'] = mt5.symbol_info_tick('XAUUSD') is not None
+          except Exception as exc:
+              result['error'] = type(exc).__name__ + ': ' + str(exc)
+          finally:
+              mt5.shutdown()
+              print(json.dumps(result))
+          raise SystemExit(0 if result['terminal_initialized'] else 1)
+          '''
+          try:
+              done = subprocess.run([sys.executable, '-c', script], text=True, capture_output=True, timeout=180)
+          except subprocess.TimeoutExpired:
+              print('FAIL: timed out waiting for MT5/Wine bridge to initialize (180s).')
+              sys.exit(1)
+          print(done.stdout)
+          print(done.stderr, file=sys.stderr)
+          sys.exit(done.returncode)
+          PY
