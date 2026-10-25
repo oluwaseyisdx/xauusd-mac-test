@@ -1,0 +1,170 @@
+name: MT5 Apple Silicon - Python 3.9 bootstrap fix (NO TRADES)
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mt5-terminal-pip39-retry.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mt5-mac-bootstrap-retry:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Confirm Apple Silicon macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sw_vers
+          uname -m
+
+      - name: Install Rosetta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+
+      - name: Install official MetaTrader 5 macOS application
+        shell: bash
+        timeout-minutes: 14
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mt5pkg"
+          curl --fail --location --show-error --silent --retry 2 --connect-timeout 20 --max-time 240 \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            --output "$RUNNER_TEMP/MetaTrader5.pkg.zip"
+          ditto -x -k "$RUNNER_TEMP/MetaTrader5.pkg.zip" "$RUNNER_TEMP/mt5pkg"
+          pkg="$(find "$RUNNER_TEMP/mt5pkg" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          test -d '/Applications/MetaTrader 5.app'
+          echo 'Official MetaTrader 5 app installed.'
+          if open -a 'MetaTrader 5'; then
+            echo 'MacOS accepted request to open MetaTrader 5 (not proof of terminal readiness).'
+          else
+            echo 'Warning: macOS could not open MT5 through LaunchServices.'
+          fi
+          sleep 12
+
+      - name: Install native macOS Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install third-party MT5 Python bridge
+        run: python -m pip install --disable-pip-version-check --no-input 'mt5_mac==0.3.0'
+
+      - name: Fix Python 3.9 incompatible get-pip bootstrap URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          import re
+
+          spec = importlib.util.find_spec('mt5_mac.bootstrap')
+          if not spec or not spec.origin:
+              raise SystemExit('Could not locate installed mt5_mac bootstrap module')
+          path = Path(spec.origin)
+          code = path.read_text(encoding='utf-8')
+          pattern = r'https://bootstrap\.pypa\.io/get-pip\.py'
+          count = len(re.findall(pattern, code))
+          print('Bootstrap module:', path)
+          print('Generic get-pip.py URL occurrences:', count)
+          if count != 1:
+              lines = [line.strip()[:180] for line in code.splitlines()
+                       if 'get-pip' in line or 'bootstrap.pypa.io' in line]
+              print('Bootstrap source references:', lines[:12])
+              raise SystemExit('STOP: Expected exactly one literal generic get-pip URL; no patch made')
+          fixed = re.sub(pattern, 'https://bootstrap.pypa.io/pip/3.9/get-pip.py', code)
+          path.write_text(fixed, encoding='utf-8')
+          print('Patched in ephemeral GitHub runner only: Python-3.9-specific get-pip URL')
+          PY
+
+      - name: Probe Wine-based MT5 initialization safely
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          report = {'platform': 'macos-arm64', 'test': 'terminal_initialize_read_only',
+                    'terminal_initialized': False, 'account_session': False,
+                    'XAUUSD_quote': False, 'orders_sent': 0}
+          worker = r'''
+          import json
+          import mt5_mac as mt5
+          out = {'bridge_import': 'PASS', 'terminal_initialized': False,
+                 'account_session': False, 'XAUUSD_quote': False,
+                 'orders_sent': 0}
+          try:
+              out['terminal_initialized'] = bool(mt5.initialize())
+              if out['terminal_initialized']:
+                  out['account_session'] = mt5.account_info() is not None
+                  out['XAUUSD_quote'] = mt5.symbol_info_tick('XAUUSD') is not None
+          except Exception as exc:
+              out['error'] = type(exc).__name__ + ': ' + str(exc)
+          finally:
+              try:
+                  mt5.shutdown()
+              except Exception as exc:
+                  out['shutdown_error'] = repr(exc)
+          print('MT5_TEST_JSON=' + json.dumps(out))
+          '''
+          try:
+              done = subprocess.run([sys.executable, '-c', worker], capture_output=True,
+                                    text=True, timeout=180,
+                                    env={**os.environ, 'PYTHONUNBUFFERED':'1'})
+              print('=== Bridge stdout ===')
+              print(done.stdout[-15000:])
+              print('=== Bridge stderr ===')
+              print(done.stderr[-15000:])
+              report['process_exit_code'] = done.returncode
+              for line in done.stdout.splitlines():
+                  if line.startswith('MT5_TEST_JSON='):
+                      report.update(json.loads(line[len('MT5_TEST_JSON='):]))
+          except subprocess.TimeoutExpired as exc:
+              report['error'] = 'TimeoutExpired: MT5 initialization exceeded 180 seconds'
+              print(report['error'])
+          Path('mt5_terminal_retry_results.json').write_text(json.dumps(report, indent=2)+'\n')
+          print('=== Final result ===')
+          print(json.dumps(report, indent=2))
+          if not report['terminal_initialized']:
+              raise SystemExit('NOT VERIFIED: MT5 Python terminal initialization did not succeed')
+          PY
+
+      - name: Diagnostics of in-Wine Python if connection did not initialize
+        if: failure()
+        shell: bash
+        run: |
+          echo '=== Installed MT5 app ==='
+          ls -ld '/Applications/MetaTrader 5.app' || true
+          echo '=== Wine prefixes and in-Wine Python ==='
+          find "$HOME/Library/Application Support" -maxdepth 8 \
+            \( -name 'python39._pth' -o -name 'python.exe' -o -name 'terminal64.exe' \) \
+            -print 2>/dev/null | head -60 || true
+          echo '=== Python embeddable path files (contents only) ==='
+          find "$HOME/Library/Application Support" -name 'python39._pth' -type f -print -exec cat {} \; 2>/dev/null | head -100 || true
+          echo '=== Relevant app processes ==='
+          pgrep -fl 'MetaTrader|terminal64|wine|wineserver' || true
+          echo 'No trades or broker credentials were used.'
+
+      - name: Upload read-only test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MT5_MAC_PIP39_RETRY_RESULTS
+          path: mt5_terminal_retry_results.json
+          if-no-files-found: warn
