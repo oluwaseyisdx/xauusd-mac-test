@@ -1,0 +1,74 @@
+# v6: the exact MetaTrader5.dmg published on Deriv's Mac download page.
+# Trade execution is disabled; credentials remain CircleCI-only.
+version: 2.1
+jobs:
+  mac-mt5-readonly:
+    macos:
+      xcode: "16.4.0"
+    resource_class: m4pro.medium
+    working_directory: ~/project
+    environment:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - checkout
+      - run:
+          name: Verify Apple Silicon and Python strategy
+          command: |
+            set -euo pipefail
+            mkdir -p verification_reports
+            test "$(uname -s)" = Darwin
+            test "$(uname -m)" = arm64
+            sw_vers
+            python3 -m unittest discover -s tests -v
+            python3 run.py
+            python3 mac_verify.py --require-apple-silicon
+      - run:
+          name: Install exact macOS DMG linked on Deriv website
+          no_output_timeout: 12m
+          command: |
+            set -euo pipefail
+            stage="$(mktemp -d)"
+            mkdir -p "$stage/mount" verification_reports
+            url='https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.dmg'
+            echo 'SOURCE=DERIV_PAGE_MAC_DMG'
+            curl -fLsS --retry 3 --connect-timeout 25 --max-time 420 "$url" -o "$stage/MetaTrader5.dmg"
+            test -s "$stage/MetaTrader5.dmg"
+            hdiutil attach "$stage/MetaTrader5.dmg" -readonly -nobrowse -noautoopen -mountpoint "$stage/mount" >/dev/null
+            app="$(find "$stage/mount" -maxdepth 4 -name '*.app' -type d -print -quit)"
+            pkg="$(find "$stage/mount" -maxdepth 4 -name '*.pkg' -print -quit)"
+            if [[ -n "$app" ]]; then
+              echo 'DMG_CONTAINS_APP=YES'
+              sudo ditto "$app" '/Applications/MetaTrader 5.app'
+              kind=app
+            elif [[ -n "$pkg" ]]; then
+              echo 'DMG_CONTAINS_PKG=YES'
+              sudo installer -pkg "$pkg" -target /
+              kind=pkg
+            else
+              echo 'UNSUPPORTED_DMG_LAYOUT=YES'
+              hdiutil detach "$stage/mount" >/dev/null || true
+              exit 2
+            fi
+            hdiutil detach "$stage/mount" >/dev/null
+            open -a 'MetaTrader 5' || true
+            sleep 30
+            wine='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+            terminal="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+            test -x "$wine"
+            test -s "$terminal"
+            printf '{"deriv_page_dmg_used":true,"dmg_installer_layout":"%s","wine_present":true,"terminal_exe_present":true,"broker_authentication_verified":false,"trades_sent":false}
+            ' "$kind" > verification_reports/deriv_dmg_install.json
+            echo 'DERIV_PAGE_DMG_INSTALLED=YES'
+      - run:
+          name: Verify read-only Deriv demo login and Python MT5 bridge
+          no_output_timeout: 12m
+          command: |
+            set -euo pipefail
+            python3 .circleci/readonly_bridge_probe.py
+      - store_artifacts:
+          path: verification_reports
+          destination: mac-mt5-readonly-reports
+workflows:
+  test-apple-silicon-mt5:
+    jobs:
+      - mac-mt5-readonly
