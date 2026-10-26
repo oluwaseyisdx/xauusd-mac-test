@@ -1,0 +1,227 @@
+name: MT5 Mac - direct Wine IPC error diagnostics (NO TRADES)
+
+on:
+  push:
+    paths:
+      - .github/workflows/mt5-direct-wine-error-diagnostics.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-mt5-wine:
+    runs-on: macos-15
+    timeout-minutes: 28
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Confirm real Apple Silicon macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sw_vers && uname -m
+
+      - name: Prepare Rosetta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+
+      - name: Install official MT5 macOS app
+        shell: bash
+        timeout-minutes: 14
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mt5pkg"
+          curl --fail --location --show-error --silent --retry 2 --connect-timeout 20 --max-time 240 \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            --output "$RUNNER_TEMP/MetaTrader5.pkg.zip"
+          ditto -x -k "$RUNNER_TEMP/MetaTrader5.pkg.zip" "$RUNNER_TEMP/mt5pkg"
+          pkg="$(find "$RUNNER_TEMP/mt5pkg" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          test -d '/Applications/MetaTrader 5.app'
+          open -a 'MetaTrader 5' || true
+          sleep 15
+          test -f "$HOME/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+
+      - name: Setup native ARM64 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install and patch mt5_mac bootstrap for Python 3.9
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-input 'mt5_mac==0.3.0'
+          python - <<'PY'
+          from pathlib import Path
+          import importlib.util
+          spec = importlib.util.find_spec('mt5_mac.bootstrap')
+          if spec is None or spec.origin is None:
+              raise SystemExit('mt5_mac bootstrap module not found')
+          p = Path(spec.origin)
+          old = 'https://bootstrap.pypa.io/get-pip.py'
+          s = p.read_text('utf-8')
+          if s.count(old) != 1:
+              raise SystemExit('Upstream mt5_mac changed; aborting temporary compatibility patch')
+          p.write_text(s.replace(old, 'https://bootstrap.pypa.io/pip/3.9/get-pip.py'), encoding='utf-8')
+          print('Temporary Python 3.9 bootstrap patch applied')
+          PY
+
+      - name: Initialize mt5_mac once to create embedded Windows Python
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import subprocess,sys
+          p=subprocess.run([sys.executable,'-c','import mt5_mac as mt5; mt5.initialize(); mt5.shutdown()'],
+                           capture_output=True,text=True,timeout=170)
+          print('Initial bootstrap status:',p.returncode)
+          print('Initial bootstrap stdout tail:',p.stdout[-800:])
+          print('Initial bootstrap stderr tail:',p.stderr[-800:])
+          PY
+          test -f "$HOME/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Python39/python39._pth"
+
+      - name: Repair embedded Python site-packages and verify official MT5 package
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          export WINEDEBUG=-all
+          WINE='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          WINPY='C:\Python39\python.exe'
+          test -x "$WINE"
+          python - <<'PY'
+          from pathlib import Path
+          p=Path.home()/'Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Python39/python39._pth'
+          lines=p.read_text('utf-8').splitlines()
+          if '#import site' in lines: lines[lines.index('#import site')]='import site'
+          elif 'import site' not in lines: lines.append('import site')
+          if 'Lib\\site-packages' not in lines: lines.insert(-1,'Lib\\site-packages')
+          p.write_text('\n'.join(lines)+'\n', encoding='utf-8')
+          print('Embedded Python site-packages enabled')
+          PY
+          if ! "$WINE" "$WINPY" -m pip --version; then
+            curl --fail --location --show-error --silent --retry 2 --max-time 120 \
+              'https://bootstrap.pypa.io/pip/3.9/get-pip.py' \
+              --output "$WINEPREFIX/drive_c/Python39/get-pip.py"
+            "$WINE" "$WINPY" 'C:\Python39\get-pip.py' --no-warn-script-location
+          fi
+          "$WINE" "$WINPY" -m pip --version
+          "$WINE" "$WINPY" -m pip install --disable-pip-version-check --no-input --only-binary=:all: 'MetaTrader5==5.0.6231'
+          "$WINE" "$WINPY" -c 'import MetaTrader5 as mt5; print("Official Wine MetaTrader5 import: PASS; version:",mt5.__version__)'
+          echo 'MT5_WINDOWS_PACKAGE_READY=1' >> "$GITHUB_ENV"
+
+      - name: Probe direct Wine MT5 initialize and capture genuine last_error
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          export WINEDEBUG=-all
+          python - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          wine='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          prefix=Path.home()/'Library/Application Support/net.metaquotes.wine.metatrader5'
+          script=prefix/'drive_c/Python39/mt5_direct_probe.py'
+          script.write_text(r'''
+          import json,sys
+          import MetaTrader5 as mt5
+          mode=sys.argv[1]
+          out={'mode':mode,'package_version':mt5.__version__,'initialize':False,'last_error':None,
+               'terminal_version_available':False,'account_present':False,'orders_sent':0}
+          try:
+              if mode=='explicit_path':
+                  ok=mt5.initialize(r'C:\Program Files\MetaTrader 5\terminal64.exe',timeout=30000)
+              else:
+                  ok=mt5.initialize(timeout=30000)
+              out['initialize']=bool(ok)
+              # This is the OFFICIAL Windows MetaTrader5 last_error(), not mt5_mac.last_error().
+              out['last_error']=list(mt5.last_error())
+              if ok:
+                  out['terminal_version_available']=mt5.version() is not None
+                  out['account_present']=mt5.account_info() is not None
+          except Exception as e:
+              out['exception']=type(e).__name__+': '+str(e)[:500]
+          finally:
+              try: mt5.shutdown()
+              except Exception: pass
+          print('DIRECT_WINE_RESULT='+json.dumps(out),flush=True)
+          ''',encoding='utf-8')
+          results={'runner':'Darwin arm64', 'direct_wine_tests':[], 'native_bridge':None,
+                   'orders_sent':0,'terminal_connection_verified':False,'note':'No broker login and no orders'}
+          for mode in ('automatic_path','explicit_path'):
+              cmd=[wine,r'C:\Python39\python.exe',r'C:\Python39\mt5_direct_probe.py',mode]
+              try:
+                  p=subprocess.run(cmd,capture_output=True,text=True,timeout=75,env={**os.environ,'WINEPREFIX':str(prefix),'WINEDEBUG':'-all'})
+                  row={'mode':mode,'process_returncode':p.returncode}
+                  for line in p.stdout.splitlines():
+                      if line.startswith('DIRECT_WINE_RESULT='):
+                          row.update(json.loads(line.partition('=')[2]))
+                  if 'last_error' not in row: row['stdout_tail']=p.stdout[-500:]; row['stderr_tail']=p.stderr[-500:]
+              except subprocess.TimeoutExpired:
+                  row={'mode':mode,'timeout':True,'initialize':False}
+              results['direct_wine_tests'].append(row)
+              print('DIRECT_PROBE_RESULT',json.dumps(row),flush=True)
+          results['terminal_connection_verified']=any(x.get('initialize') is True for x in results['direct_wine_tests'])
+          Path('mt5_direct_wine_diagnostic.json').write_text(json.dumps(results,indent=2)+'\n')
+          PY
+
+      - name: Probe native mt5_mac bridge separately
+        shell: bash
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,subprocess,sys
+          from pathlib import Path
+          program=r'''
+          import json,mt5_mac as mt5
+          out={'bridge_import':True,'initialize':False,'account_present':False,'orders_sent':0}
+          try:
+              ok=bool(mt5.initialize())
+              out['initialize']=ok
+              if ok: out['account_present']=mt5.account_info() is not None
+          except Exception as e:
+              out['exception']=type(e).__name__+': '+str(e)[:500]
+          finally:
+              try:mt5.shutdown()
+              except Exception:pass
+          print('NATIVE_BRIDGE_RESULT='+json.dumps(out),flush=True)
+          '''
+          try:
+              p=subprocess.run([sys.executable,'-c',program],capture_output=True,text=True,timeout=170)
+              row={'process_returncode':p.returncode}
+              for line in p.stdout.splitlines():
+                  if line.startswith('NATIVE_BRIDGE_RESULT='):row.update(json.loads(line.partition('=')[2]))
+              if 'initialize' not in row:row['stdout_tail']=p.stdout[-700:];row['stderr_tail']=p.stderr[-700:]
+          except subprocess.TimeoutExpired:
+              row={'initialize':False,'timeout':True}
+          path=Path('mt5_direct_wine_diagnostic.json')
+          report=json.loads(path.read_text('utf-8'))
+          report['native_bridge']=row
+          report['bridge_connection_verified']=row.get('initialize') is True
+          path.write_text(json.dumps(report,indent=2)+'\n')
+          print('NATIVE_BRIDGE_PROBE_RESULT',json.dumps(row))
+          print('VERDICT:', 'Bridge initialized' if report['bridge_connection_verified'] else 'Bridge still failed to initialize')
+          if not report['bridge_connection_verified']:
+              raise SystemExit('NOT VERIFIED: native Python to MT5 bridge is not initialized; check direct-Wine last_error in artifact')
+          PY
+
+      - name: Upload connection diagnostics, including on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MT5_DIRECT_WINE_ERROR_DIAGNOSTICS
+          path: mt5_direct_wine_diagnostic.json
+          if-no-files-found: warn
