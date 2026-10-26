@@ -1,0 +1,94 @@
+name: MT5 Test 12 - exact Mac Wine agent dependency pins (NO TRADES)
+on:
+  push:
+    paths:
+      - .github/workflows/mt5_test12_apple_silicon_exact_pins.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  exact-agent-on-apple-silicon:
+    runs-on: macos-15
+    timeout-minutes: 28
+    steps:
+      - name: Check Apple Silicon and install Rosetta
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sw_vers
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+      - name: Validate native pinned NumPy/pandas on ARM64 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Import the native ARM64 math dependencies
+        shell: bash
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --only-binary=:all: 'numpy==2.5.3' 'pandas==3.0.6'
+          python - <<'PY'
+          import platform, numpy, pandas
+          assert platform.machine() == 'arm64'
+          assert numpy.__version__ == '2.5.3'
+          assert pandas.__version__ == '3.0.6'
+          print('MAC_NATIVE_PIN_IMPORT=PASS')
+          PY
+      - name: Install official MT5 app and bundled Wine runtime
+        shell: bash
+        timeout-minutes: 13
+        run: |
+          set -euo pipefail
+          curl --fail --location --show-error --silent --retry 2 --max-time 240 \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            -o "$RUNNER_TEMP/mt5.zip"
+          mkdir -p "$RUNNER_TEMP/mt5pkg"
+          ditto -x -k "$RUNNER_TEMP/mt5.zip" "$RUNNER_TEMP/mt5pkg"
+          pkg="$(find "$RUNNER_TEMP/mt5pkg" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          open -a 'MetaTrader 5' || true
+          sleep 12
+          test -x '/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+      - name: Set up exact Windows x64 Python 3.12.10 in Wine
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          PREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          PYPATH="$PREFIX/drive_c/Python312"
+          mkdir -p "$PYPATH/Lib/site-packages"
+          curl --fail --location --show-error --silent --retry 2 --max-time 180 \
+            'https://www.python.org/ftp/python/3.12.10/python-3.12.10-embeddable-amd64.zip' \
+            -o "$RUNNER_TEMP/python312-embed.zip"
+          ditto -x -k "$RUNNER_TEMP/python312-embed.zip" "$PYPATH"
+          python - <<'PY'
+          import pathlib
+          p=pathlib.Path.home()/'Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Python312/python312._pth'
+          rows=p.read_text().splitlines()
+          if '#import site' in rows:rows[rows.index('#import site')]='import site'
+          elif 'import site' not in rows:rows.append('import site')
+          if r'Lib\site-packages' not in rows:rows.insert(-1,r'Lib\site-packages')
+          p.write_text('\n'.join(rows)+'\n')
+          PY
+          export WINEPREFIX="$PREFIX" WINEDEBUG=-all
+          WINE='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          "$WINE" 'C:\Python312\python.exe' --version
+          curl --fail --location --show-error --silent --retry 2 --max-time 180 \
+            'https://bootstrap.pypa.io/get-pip.py' -o "$PYPATH/get-pip.py"
+          "$WINE" 'C:\Python312\python.exe' 'C:\Python312\get-pip.py' --no-warn-script-location
+          "$WINE" 'C:\Python312\python.exe' -m pip --version
+      - name: Test exactly MetaTrader5 5.0.6180 and NumPy 1.26.4 in Wine
+        shell: bash
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5" WINEDEBUG=-all
+          WINE='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          WINPY='C:\Python312\python.exe'
+          "$WINE" "$WINPY" -m pip install --disable-pip-version-check --no-input --only-binary=:all: \
+            'MetaTrader5==5.0.6180' 'numpy==1.26.4'
+          "$WINE" "$WINPY" -c 'import platform,numpy,MetaTrader5 as m; assert platform.python_version().startswith("3.12."); assert numpy.__version__=="1.26.4"; assert m.__version__=="5.0.6180"; assert all(callable(getattr(m,x,None)) for x in ("initialize","account_info","symbol_info_tick","copy_rates_from_pos","order_check","order_send")); print("WINE_AGENT_EXACT_PIN_IMPORT=PASS; MT5_IPC_AND_TRADES_NOT_TESTED")'
