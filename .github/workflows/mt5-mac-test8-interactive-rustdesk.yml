@@ -1,0 +1,116 @@
+name: MT5 Mac Test 8 - experimental interactive desktop (NO TRADES)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mt5-experimental-interactive-desktop
+  cancel-in-progress: true
+
+jobs:
+  desktop-smoke:
+    runs-on: macos-15
+    timeout-minutes: 50
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Check temporary ARM64 Mac and required secret
+        shell: bash
+        env:
+          MAC_REMOTE_PASSWORD: ${{ secrets.MAC_REMOTE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
+          test "${#MAC_REMOTE_PASSWORD}" -ge 18 || { echo 'MISSING: create MAC_REMOTE_PASSWORD GitHub Actions secret (18+ characters).'; exit 1; }
+          echo 'Real Apple Silicon runner: PASS; remote access password present (never displayed).'
+          sw_vers
+
+      - name: Install and launch official MT5 for macOS
+        shell: bash
+        timeout-minutes: 14
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mt5pkg"
+          curl --fail --location --show-error --silent --retry 2 --connect-timeout 20 --max-time 240 \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            --output "$RUNNER_TEMP/mt5.zip"
+          ditto -x -k "$RUNNER_TEMP/mt5.zip" "$RUNNER_TEMP/mt5pkg"
+          pkg="$(find "$RUNNER_TEMP/mt5pkg" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          test -d '/Applications/MetaTrader 5.app'
+          open -a 'MetaTrader 5' || true
+          echo 'Official MT5 installed and application launch requested.'
+
+      - name: Install official RustDesk Apple Silicon client
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          curl --fail --location --show-error --silent --retry 2 --connect-timeout 20 --max-time 180 \
+            'https://github.com/rustdesk/rustdesk/releases/download/1.5.0/rustdesk-1.5.0-aarch64.dmg' \
+            -o "$RUNNER_TEMP/rustdesk-arm64.dmg"
+          mkdir -p "$RUNNER_TEMP/rustdesk-disk"
+          hdiutil attach "$RUNNER_TEMP/rustdesk-arm64.dmg" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/rustdesk-disk"
+          test -d "$RUNNER_TEMP/rustdesk-disk/RustDesk.app"
+          ditto "$RUNNER_TEMP/rustdesk-disk/RustDesk.app" '/Applications/RustDesk.app'
+          hdiutil detach "$RUNNER_TEMP/rustdesk-disk" || true
+          codesign --verify --deep --strict '/Applications/RustDesk.app'
+          echo 'RustDesk official release 1.5.0 installed and code signature verified.'
+
+      - name: Configure experimental RustDesk remote session (password secret only)
+        shell: bash
+        timeout-minutes: 3
+        env:
+          MAC_REMOTE_PASSWORD: ${{ secrets.MAC_REMOTE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          open -a RustDesk || true
+          sleep 12
+          python3 - <<'PY'
+          import os,subprocess
+          from pathlib import Path
+          app = Path('/Applications/RustDesk.app/Contents/MacOS')
+          bins = [x for x in app.iterdir() if x.is_file() and 'rustdesk' in x.name.lower()]
+          if not bins: raise SystemExit('RustDesk executable not found')
+          exe = str(bins[0])
+          password = os.environ['MAC_REMOTE_PASSWORD']
+          for argv in ([exe,'--password',password], ['sudo',exe,'--password',password]):
+              try:
+                  p = subprocess.run(argv, capture_output=True, text=True, timeout=25)
+                  print('RustDesk password configuration command return code:',p.returncode)
+                  if p.returncode == 0: break
+              except subprocess.TimeoutExpired:
+                  print('RustDesk password setup timed out (no password printed).')
+          else:
+              print('WARNING: RustDesk password command could not be confirmed.')
+          try:
+              p = subprocess.run([exe,'--get-id'], capture_output=True, text=True, timeout=20)
+              rid = p.stdout.strip()
+              import re
+              if p.returncode == 0 and re.fullmatch(r'[A-Za-z0-9_-]{6,24}',rid):
+                  print('RUSTDESK_ID='+rid)
+                  print('Use the ID above and your own MAC_REMOTE_PASSWORD in RustDesk on iPhone.')
+              else:
+                  print('RUSTDESK_ID_NOT_AVAILABLE: remote access cannot be verified from this run.')
+          except subprocess.TimeoutExpired:
+              print('RUSTDESK_ID_TIMEOUT: remote access is not verified.')
+          PY
+          echo 'macOS Screen Recording and Accessibility permissions may still prevent viewing/control.'
+
+      - name: Verify GUI session exists and keep temporary test desktop available
+        shell: bash
+        timeout-minutes: 32
+        run: |
+          set -euo pipefail
+          echo 'Remote desktop experiment active. Check previous step for RUSTDESK_ID.'
+          echo 'Purpose: inspect MT5 start-up GUI and determine if interactive login can work.'
+          echo 'Never log in to a real-money account; this temporary runner is not trusted storage.'
+          for n in $(seq 1 27); do
+            echo "Desktop test heartbeat $n/27"
+            ps -axo pid,comm | grep -Ei 'RustDesk|MetaTrader|wine64' | head -12 || true
+            sleep 60
+          done
