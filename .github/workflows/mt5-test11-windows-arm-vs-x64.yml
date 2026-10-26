@@ -1,0 +1,199 @@
+name: MT5 Test 11 - Windows ARM vs x64 compatibility (NO TRADES)
+
+on:
+  push:
+    paths:
+      - .github/workflows/mt5-test11-windows-arm-vs-x64.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare-arm-x64:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-11-arm]
+    name: MT5 Windows test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Identify real host architecture
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hostArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          Write-Output "HOST_OS_ARCH=$hostArch"
+          Write-Output "RUNNER_ARCH=$env:RUNNER_ARCH"
+          Write-Output "RUNNER_OS=$env:RUNNER_OS"
+          if ('${{ matrix.os }}' -eq 'windows-11-arm' -and $hostArch -ne 'Arm64') {
+            throw 'This test requires a genuine Windows ARM64 runner.'
+          }
+
+      - name: Install official x64 Python 3.12 in portable mode
+        id: python
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'mt5-winarm-test'
+          $pyDir = Join-Path $root 'python-x64'
+          New-Item -ItemType Directory -Force -Path $pyDir | Out-Null
+          $zip = Join-Path $root 'python-x64.zip'
+          Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $pyDir -Force
+          $pth = Join-Path $pyDir 'python312._pth'
+          $lines = [System.Collections.Generic.List[string]]::new()
+          foreach ($line in (Get-Content $pth)) {
+            if ($line.Trim() -eq '#import site') { $lines.Add('import site') }
+            else { $lines.Add($line) }
+          }
+          if (-not ($lines -contains 'import site')) { $lines.Add('import site') }
+          if (-not ($lines -contains 'Lib\site-packages')) { $lines.Insert(0, 'Lib\site-packages') }
+          New-Item -ItemType Directory -Force -Path (Join-Path $pyDir 'Lib\site-packages') | Out-Null
+          Set-Content -Path $pth -Value $lines -Encoding ascii
+          $py = Join-Path $pyDir 'python.exe'
+          & $py -c 'import platform,sys; print("PYTHON_MACHINE=" + platform.machine()); print("PYTHON_BITS=" + str(sys.maxsize.bit_length()+1))'
+          if ($LASTEXITCODE -ne 0) { throw 'Official x64 Python could not execute.' }
+          $getpip = Join-Path $root 'get-pip.py'
+          Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $getpip
+          & $py $getpip --disable-pip-version-check --no-warn-script-location
+          if ($LASTEXITCODE -ne 0) { throw 'pip setup failed.' }
+          "TEST11_PY=$py" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TEST11_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Output 'Official CPython AMD64 installed in an isolated temporary directory.'
+
+      - name: Install and import official Windows x64 MetaTrader5 Python package
+        id: python-mt5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:TEST11_PY -m pip install --no-input --disable-pip-version-check --only-binary=:all: 'MetaTrader5==5.0.6231'
+          if ($LASTEXITCODE -ne 0) { throw 'Official MetaTrader5 win_amd64 wheel failed to install.' }
+          & $env:TEST11_PY -c 'import platform,MetaTrader5 as mt5,numpy; print("ARCH="+platform.machine()); print("MT5_PYTHON_IMPORT_PASS="+mt5.__version__); print("NUMPY_VERSION="+numpy.__version__)'
+          if ($LASTEXITCODE -ne 0) { throw 'Official MetaTrader5 package cannot import under x64 emulation.' }
+
+      - name: Download and auto-install official MT5 Windows terminal
+        id: terminal
+        continue-on-error: true
+        timeout-minutes: 11
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Join-Path $env:TEST11_ROOT 'mt5setup.exe'
+          $target = Join-Path $env:TEST11_ROOT 'terminal'
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          Invoke-WebRequest -Uri 'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe' -OutFile $setup
+          $signature = Get-AuthenticodeSignature -FilePath $setup
+          Write-Output "INSTALLER_SIGNATURE_STATUS=$($signature.Status)"
+          Write-Output "INSTALLER_SIGNER=$($signature.SignerCertificate.Subject)"
+          if ($signature.Status -ne 'Valid') { throw 'Installer signature is not valid. Refusing to execute.' }
+          if ($signature.SignerCertificate.Subject -notmatch 'MetaQuotes') { throw 'Installer publisher could not be verified as MetaQuotes.' }
+          $arguments = '/auto /path:"' + $target + '"'
+          $proc = Start-Process -FilePath $setup -ArgumentList $arguments -PassThru
+          if (-not $proc.WaitForExit(360000)) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Write-Output 'INSTALLER_TIMEOUT=YES'
+          } else {
+            Write-Output "INSTALLER_EXIT_CODE=$($proc.ExitCode)"
+          }
+          $terminal = Join-Path $target 'terminal64.exe'
+          if (-not (Test-Path $terminal)) {
+            $alternatives = @(
+              (Join-Path $env:ProgramFiles 'MetaTrader 5\terminal64.exe'),
+              (Join-Path ${env:ProgramFiles(x86)} 'MetaTrader 5\terminal64.exe')
+            )
+            $terminal = $alternatives | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $terminal -or -not (Test-Path $terminal)) {
+            Write-Output 'MT5_TERMINAL_EXE_FOUND=NO'
+            throw 'MT5 terminal64.exe was not installed or could not be found.'
+          }
+          Write-Output 'MT5_TERMINAL_EXE_FOUND=YES'
+          "TEST11_TERMINAL=$terminal" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Probe terminal and official Python IPC without accounts or orders
+        id: probe
+        if: always() && steps.python-mt5.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:TEST11_ROOT
+          $probe = Join-Path $root 'probe.py'
+          @'
+          import json, os, platform, subprocess, sys
+          result = {
+              'host_windows_arch': os.environ.get('RUNNER_ARCH', 'unknown'),
+              'python_arch': platform.machine(),
+              'trades_sent': 0,
+              'demo_or_live_account_used': False,
+              'official_python_package_imported': False,
+              'terminal_executable_found': False,
+              'terminal_process_launch_attempted': False,
+              'mt5_ipc_initialized': False,
+          }
+          import MetaTrader5 as mt5
+          result['official_python_package_imported'] = True
+          result['official_python_package_version'] = mt5.__version__
+          exe = os.environ.get('TEST11_TERMINAL', '')
+          if exe and os.path.exists(exe):
+              result['terminal_executable_found'] = True
+              try:
+                  p = subprocess.Popen([exe, '/portable'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  result['terminal_process_launch_attempted'] = True
+                  result['terminal_process_pid_present'] = bool(p.pid)
+                  import time
+                  time.sleep(14)
+                  result['terminal_process_remains_alive'] = p.poll() is None
+              except Exception as exc:
+                  result['terminal_launch_error_type'] = type(exc).__name__
+              child_code = '''import json, MetaTrader5 as m
+          o={'connected':False, 'trades_sent':0}
+          try:
+              o['connected']=bool(m.initialize(r"''' + exe + '''", timeout=12000))
+              o['error_code']=m.last_error()[0]
+              if o['connected']:
+                  o['terminal_version']=m.version()
+          except Exception as exc:
+              o['exception_type']=type(exc).__name__
+          finally:
+              try: m.shutdown()
+              except Exception: pass
+          print('MT5_IPC='+json.dumps(o),flush=True)
+          '''
+              try:
+                  p = subprocess.run([sys.executable, '-c', child_code], capture_output=True,
+                      text=True, timeout=45)
+                  result['ipc_subprocess_returncode'] = p.returncode
+                  for line in p.stdout.splitlines():
+                      if line.startswith('MT5_IPC='):
+                          v = json.loads(line.split('=', 1)[1])
+                          result['mt5_ipc_initialized'] = v.get('connected', False)
+                          result['mt5_last_error_code'] = v.get('error_code')
+                          result['mt5_terminal_version'] = v.get('terminal_version')
+                          if v.get('exception_type'):
+                              result['ipc_exception_type'] = v['exception_type']
+              except subprocess.TimeoutExpired:
+                  result['ipc_subprocess_timeout'] = True
+          else:
+              result['note'] = 'No terminal was installed; IPC could not be tested.'
+          target = os.path.join(os.environ['RUNNER_TEMP'], 'mt5_test11_result.json')
+          with open(target, 'w', encoding='utf-8') as f:
+              json.dump(result, f, indent=2)
+          print('TEST11_SANITIZED_RESULT='+json.dumps(result), flush=True)
+          '@ | Set-Content -Path $probe -Encoding utf8
+          & $env:TEST11_PY $probe
+          if ($LASTEXITCODE -ne 0) { throw 'The diagnostic probe failed.' }
+          # This does not claim Mac compatibility even if IPC succeeds.
+          if (-not (Test-Path (Join-Path $env:RUNNER_TEMP 'mt5_test11_result.json'))) {
+            throw 'Diagnostic report was not generated.'
+          }
+
+      - name: Upload sanitized ARM and x64 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt5-test11-${{ matrix.os }}
+          path: ${{ runner.temp }}/mt5_test11_result.json
+          if-no-files-found: warn
+          retention-days: 3
