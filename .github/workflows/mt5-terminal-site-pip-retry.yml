@@ -1,0 +1,215 @@
+name: MT5 Apple Silicon - embedded Python pip/site repair (NO TRADES)
+
+on:
+  push:
+    paths:
+      - .github/workflows/mt5-terminal-site-pip-retry.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-mt5-bridge:
+    runs-on: macos-15
+    timeout-minutes: 28
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Verify genuine ARM64 macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sw_vers
+          uname -m
+
+      - name: Prepare Rosetta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+
+      - name: Install official MetaTrader 5 application in isolated runner
+        shell: bash
+        timeout-minutes: 14
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mt5pkg"
+          curl --fail --location --show-error --silent --retry 2 \
+            --connect-timeout 20 --max-time 240 \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            --output "$RUNNER_TEMP/MetaTrader5.pkg.zip"
+          ditto -x -k "$RUNNER_TEMP/MetaTrader5.pkg.zip" "$RUNNER_TEMP/mt5pkg"
+          pkg="$(find "$RUNNER_TEMP/mt5pkg" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          test -d '/Applications/MetaTrader 5.app'
+          open -a 'MetaTrader 5' || true
+          sleep 12
+          echo 'Official MT5 package installed. This does not prove a broker connection.'
+
+      - name: Set up native ARM64 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install mt5_mac bridge version used in prior tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-input 'mt5_mac==0.3.0'
+          python -c "import mt5_mac; print('Native bridge import: PASS')"
+
+      - name: Patch Python 3.9 get-pip URL in temporary runner only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          src = importlib.util.find_spec('mt5_mac.bootstrap')
+          if not src or not src.origin:
+              raise SystemExit('Cannot locate mt5_mac.bootstrap')
+          path = Path(src.origin)
+          old = 'https://bootstrap.pypa.io/get-pip.py'
+          new = 'https://bootstrap.pypa.io/pip/3.9/get-pip.py'
+          text = path.read_text('utf-8')
+          if text.count(old) != 1:
+              raise SystemExit('Unexpected upstream bootstrap version; refusing patch')
+          path.write_text(text.replace(old, new), encoding='utf-8')
+          print('Pinned Python 3.9 get-pip URL in ephemeral runner')
+          PY
+
+      - name: First-run bootstrap, then enable embedded Python site-packages
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Initial bridge call creates C:\\Python39 inside MT5 Wine prefix. It may fail
+          # before pip becomes discoverable. That expected bootstrap error is captured.
+          python - <<'PY'
+          import subprocess, sys
+          script = "import mt5_mac as mt5; print('INITIALIZED', bool(mt5.initialize())); mt5.shutdown()"
+          try:
+              p = subprocess.run([sys.executable,'-c',script],capture_output=True,text=True,timeout=170)
+              print('First bootstrap exit:',p.returncode)
+              print('Bootstrap tail stdout:',p.stdout[-1800:])
+              print('Bootstrap tail stderr:',p.stderr[-1000:])
+          except subprocess.TimeoutExpired:
+              print('First bootstrap exceeded 170 seconds; checking generated environment.')
+          PY
+          python - <<'PY'
+          from pathlib import Path
+          p = Path.home()/'Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Python39/python39._pth'
+          if not p.is_file():
+              raise SystemExit('No Wine embedded Python ._pth found; first bootstrap did not prepare Python')
+          current = p.read_text('utf-8')
+          print('Embedded Python path file:',p)
+          print('BEFORE:',repr(current))
+          lines = current.splitlines()
+          if 'import site' not in lines:
+              if '#import site' in lines:
+                  lines[lines.index('#import site')] = 'import site'
+              else:
+                  lines.append('import site')
+          # Add explicit site-packages path so pip is discoverable from embedded CPython.
+          if 'Lib\\site-packages' not in lines:
+              lines.insert(-1, 'Lib\\site-packages')
+          p.write_text('\n'.join(lines)+'\n', encoding='utf-8')
+          assert 'import site' in p.read_text('utf-8').splitlines()
+          print('AFTER:', repr(p.read_text('utf-8')))
+          PY
+
+      - name: Verify pip inside Wine Python; repair only when missing
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          export WINEDEBUG=-all
+          WINE='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          test -x "$WINE" || { echo 'Wine launcher missing from expected MT5.app path'; exit 1; }
+          WINPY='C:\Python39\python.exe'
+          "$WINE" "$WINPY" -c 'import sys,site; print("Embedded Python:",sys.version); print("site:",site.__file__); print("sys.path:",sys.path)'
+          if "$WINE" "$WINPY" -m pip --version; then
+            echo 'pip now visible with repaired ._pth'
+          else
+            echo 'Installing Python 3.9-compatible pip into embedded Windows Python'
+            curl --fail --location --show-error --silent --retry 2 --max-time 120 \
+              'https://bootstrap.pypa.io/pip/3.9/get-pip.py' \
+              --output "$WINEPREFIX/drive_c/Python39/get-pip.py"
+            "$WINE" "$WINPY" 'C:\Python39\get-pip.py' --no-warn-script-location
+            "$WINE" "$WINPY" -m pip --version
+          fi
+          echo 'WINE_PIP_PASS=1' >> "$GITHUB_ENV"
+
+      - name: Install official Windows MT5 Python connector within Wine
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          export WINEDEBUG=-all
+          WINE='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          WINPY='C:\Python39\python.exe'
+          "$WINE" "$WINPY" -m pip install --disable-pip-version-check --no-input --only-binary=:all: 'MetaTrader5==5.0.6231'
+          "$WINE" "$WINPY" -c 'import MetaTrader5 as mt5; print("Official Windows MetaTrader5 import: PASS"); print("Package version:", mt5.__version__)'
+          echo 'WINE_MT5_PACKAGE_PASS=1' >> "$GITHUB_ENV"
+
+      - name: Read-only native Python -> Wine MT5 handshake
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys
+          from pathlib import Path
+          report = {'runtime':'Apple Silicon macOS', 'orders_sent':0,
+                    'native_bridge_import':False, 'wine_pip_works':True,
+                    'official_wine_MT5_import':True,'terminal_initialized':False,
+                    'account_session':False,'xauusd_quote':False}
+          program = r'''
+          import json
+          import mt5_mac as mt5
+          result = {'native_bridge_import':True,'terminal_initialized':False,'account_session':False,'xauusd_quote':False}
+          try:
+              result['terminal_initialized'] = bool(mt5.initialize())
+              if result['terminal_initialized']:
+                  result['account_session'] = mt5.account_info() is not None
+                  if result['account_session']:
+                      result['xauusd_quote'] = mt5.symbol_info_tick('XAUUSD') is not None
+          except Exception as ex:
+              result['exception'] = type(ex).__name__ + ': ' + str(ex)
+          finally:
+              try:
+                  mt5.shutdown()
+              except Exception as ex:
+                  result['shutdown_exception'] = type(ex).__name__ + ': ' + str(ex)
+          print('MT5_READONLY_JSON='+json.dumps(result))
+          '''
+          try:
+              process = subprocess.run([sys.executable,'-c',program],capture_output=True,text=True,timeout=170)
+              for line in process.stdout.splitlines():
+                  if line.startswith('MT5_READONLY_JSON='):
+                      report.update(json.loads(line.split('=',1)[1]))
+              report['worker_exit_code'] = process.returncode
+              print('Bridge stdout tail:',process.stdout[-4000:])
+              print('Bridge stderr tail:',process.stderr[-2000:])
+          except subprocess.TimeoutExpired:
+              report['exception']='Timed out after 170 seconds'
+          Path('mt5_site_pip_retry_results.json').write_text(json.dumps(report,indent=2)+'\n')
+          print('FINAL_DIAGNOSTIC:',json.dumps(report,indent=2))
+          if not report['terminal_initialized']:
+              raise SystemExit('NOT VERIFIED: MT5 terminal handshake failed (no broker or trade access tested)')
+          PY
+
+      - name: Upload diagnostic results (no credentials)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MT5_MAC_SITE_PIP_RESULTS
+          path: mt5_site_pip_retry_results.json
+          if-no-files-found: warn
