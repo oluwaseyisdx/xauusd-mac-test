@@ -2,7 +2,7 @@
 # Store any future demo credentials in Codemagic Secret variables, never here.
 workflows:
   dualbot-m2-readonly:
-     name: DualBot - Apple Silicon M2 readiness and official MT5 (NO TRADES)
+    name: DualBot - Apple Silicon M2 readiness and official MT5 (NO TRADES)
     instance_type: mac_mini_m2
     max_build_duration: 45
     environment:
