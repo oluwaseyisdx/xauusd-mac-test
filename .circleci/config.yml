@@ -49,10 +49,9 @@ jobs:
             test -x '/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
             echo 'OFFICIAL_MAC_MT5_INSTALLED=YES'
 
-       - macos/enable-vnc:
+      - macos/enable-vnc:
           username: vncuser
           password: MAC_VNC_PASSWORD
-
       - run:
           name: Launch MT5 GUI for interactive Deriv.com Limited broker search
           no_output_timeout: 5m
