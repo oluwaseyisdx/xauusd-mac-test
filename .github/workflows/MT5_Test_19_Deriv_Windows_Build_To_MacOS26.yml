@@ -1,0 +1,705 @@
+name: MT5 Test 19 - Deriv build transfer to Apple Silicon Wine (NO TRADES)
+on:
+  push:
+    paths:
+      - .github/workflows/MT5_Test_19_Deriv_Windows_Build_To_MacOS26.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: mt5-test19-deriv-transfer
+  cancel-in-progress: true
+jobs:
+  mql5-file-bridge:
+    needs: deriv-branded-windows-terminal
+    runs-on: macos-26
+    timeout-minutes: 40
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Confirm macOS 26 Apple Silicon and Rosetta
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test "$(uname -s)" = Darwin
+          echo "APPLE_SILICON=YES"
+          sw_vers
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+      - name: Install MetaQuotes official Mac app and bundled Wine
+        shell: bash
+        timeout-minutes: 14
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mt5pkg"
+          curl -fLsS --retry 2 --connect-timeout 20 --max-time 240   'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip'   -o "$RUNNER_TEMP/mt5pkg.zip"
+          ditto -x -k "$RUNNER_TEMP/mt5pkg.zip" "$RUNNER_TEMP/mt5pkg"
+          pkg="$(find "$RUNNER_TEMP/mt5pkg" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          test -x '/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          open -a 'MetaTrader 5' || true
+          sleep 15
+          test -f "$HOME/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"
+          echo "MT5_APP_WINE_METAEDITOR=YES"
+      - name: Download official Deriv Windows app from same-workflow artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: MT5_TEST19_WINDOWS_APP_TRANSFER
+          path: ${{ runner.temp }}/test19_transfer
+      - name: Verify Windows-to-Mac transfer and extract isolated Deriv terminal
+        shell: bash
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          python3 - <<'PY_IMPORT'
+          import hashlib,json,os,zipfile
+          from pathlib import Path
+          src=Path(os.environ['RUNNER_TEMP'])/'test19_transfer'
+          manifest=json.loads((src/'manifest.json').read_text(encoding='utf-8-sig'))
+          archive=src/'DerivMT5App.zip'
+          if not archive.is_file():
+              raise SystemExit('TEST19_TRANSFER_ZIP_MISSING')
+          checksum=hashlib.sha256(archive.read_bytes()).hexdigest()
+          if checksum != manifest['archive_sha256']:
+              raise SystemExit('TEST19_TRANSFER_CHECKSUM_MISMATCH')
+          expected=int(manifest['build'])
+          if expected<6200:
+              raise SystemExit('TEST19_WINDOWS_BUILD_TOO_OLD')
+          root=Path(os.environ['WINEPREFIX'])/'drive_c/DerivMT5Test19'
+          root.mkdir(parents=True,exist_ok=True)
+          with zipfile.ZipFile(archive) as z:
+              names=z.namelist()
+              if not any(x.casefold()=='terminal64.exe' for x in names):
+                  raise SystemExit('TEST19_TERMINAL_BINARY_NOT_IN_ZIP')
+              for member in z.infolist():
+                  name=member.filename.replace('\\','/')
+                  parts=Path(name).parts
+                  if name.startswith('/') or '..' in parts or ':' in name or member.is_dir() and len(parts)==0:
+                      raise SystemExit('TEST19_UNSAFE_ARCHIVE_PATH')
+              z.extractall(root)
+          terminal=root/'terminal64.exe'
+          metaeditor=root/'metaeditor64.exe'
+          if not terminal.is_file() or terminal.stat().st_size<1024*1024:
+              raise SystemExit('TEST19_TRANSFER_TERMINAL_MISSING')
+          if not metaeditor.is_file():
+              raise SystemExit('TEST19_TRANSFER_METAEDITOR_MISSING')
+          expected_hash=manifest['terminal_sha256']
+          with terminal.open('rb') as fh:
+              h=hashlib.file_digest(fh,'sha256').hexdigest()
+          if h!=expected_hash:
+              raise SystemExit('TEST19_TRANSFER_TERMINAL_HASH_MISMATCH')
+          report={'windows_build_expected':expected,'archive_verified':True,
+                  'terminal_binary_verified':True,'metaeditor_present':True,
+                  'extracted_file_count':sum(1 for f in root.rglob('*') if f.is_file()),
+                  'portable_target':True}
+          (Path(os.environ['RUNNER_TEMP'])/'test19_transfer_report.json').write_text(json.dumps(report))
+          print('TEST19_TRANSFER_REPORT='+json.dumps(report,sort_keys=True),flush=True)
+          PY_IMPORT
+      - name: Compile MQL5 read-only bridge with MetaEditor in Wine
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5" WINEDEBUG=-all
+          cat > "$RUNNER_TEMP/DualBotReadOnlyBridge.mq5" <<'BRIDGE_SOURCE_EOF'
+          // DualBot Test 19 — MT5 build/network and read-only file bridge qualification
+          // Writes a heartbeat and minimal quote/account flags to FILE_COMMON.
+          // Deliberately has no CTrade, OrderSend, WebRequest, sockets, or DLL imports.
+          #property strict
+          #property version "1.00"
+          #property description "Read-only qualification bridge; never submits trades"
+
+          #define BRIDGE_RUN_ID "__BRIDGE_RUN_ID__"
+
+          int g_sequence=0;
+
+          void PublishSnapshot()
+          {
+             const bool connected=(bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+             const bool is_demo=(AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_DEMO);
+             const string account_server=AccountInfoString(ACCOUNT_SERVER);
+             const int terminal_build=(int)TerminalInfoInteger(TERMINAL_BUILD);
+             MqlTick tick;
+             ZeroMemory(tick);
+             string quote_symbol=_Symbol;
+             bool tick_present=SymbolInfoTick(quote_symbol,tick);
+             // Broker-specific Deriv accounts need not offer EURUSD. Scan displayed
+             // Market Watch instruments for a valid live tick without trading.
+             if(!tick_present || tick.bid<=0.0 || tick.ask<=tick.bid || tick.time<=0)
+             {
+                int total=SymbolsTotal(true);
+                if(total>120) total=120;
+                for(int i=0;i<total;i++)
+                {
+                   string candidate=SymbolName(i,true);
+                   MqlTick probe;
+                   ZeroMemory(probe);
+                   if(SymbolInfoTick(candidate,probe) && probe.bid>0.0 && probe.ask>probe.bid && probe.time>0)
+                   {
+                      quote_symbol=candidate;
+                      tick=probe;
+                      tick_present=true;
+                      break;
+                   }
+                }
+             }
+             const bool quote_available=(connected && tick_present && tick.bid>0.0 && tick.ask>tick.bid && tick.time>0);
+             int handle=FileOpen("DUALBOT_TEST14_BRIDGE.csv",
+                      FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ|FILE_COMMON,
+                      ';',CP_UTF8);
+             if(handle==INVALID_HANDLE)
+             {
+                Print("DUALBOT_TEST14_FILE_OPEN_FAILED error=",GetLastError());
+                return;
+             }
+             g_sequence++;
+             FileWrite(handle,"run_id","seq","terminal_connected","demo_account","quotes_available","symbol","bid","ask","tick_unix_seconds","orders_sent","account_login","account_server","terminal_build");
+             FileWrite(handle,BRIDGE_RUN_ID,g_sequence,(int)connected,(int)is_demo,(int)quote_available,
+                       quote_symbol,DoubleToString(tick.bid,8),DoubleToString(tick.ask,8),
+                       (long)tick.time,0,(long)AccountInfoInteger(ACCOUNT_LOGIN),account_server,terminal_build);
+             FileFlush(handle);
+             FileClose(handle);
+             if(g_sequence==1)
+                Print("DUALBOT_TEST14_MQL5_FILE_BRIDGE_WRITTEN");
+          }
+
+          int OnInit()
+          {
+             EventSetTimer(2);
+             PublishSnapshot();
+             return INIT_SUCCEEDED;
+          }
+
+          void OnTimer()
+          {
+             PublishSnapshot();
+          }
+
+          void OnDeinit(const int reason)
+          {
+             EventKillTimer();
+          }
+          BRIDGE_SOURCE_EOF
+
+          python3 - <<'PY_COMPILE'
+          import os, shutil, subprocess, time, json
+          from pathlib import Path
+          prefix=Path(os.environ['WINEPREFIX'])
+          source=Path(os.environ['RUNNER_TEMP'])/'DualBotReadOnlyBridge.mq5'
+          code=source.read_text(encoding='utf-8').replace('__BRIDGE_RUN_ID__',os.environ['GITHUB_RUN_ID'])
+          assert 'OrderSend(' not in code and 'WebRequest(' not in code
+          windows_folder=prefix/'drive_c/DualBotBridge14'
+          windows_folder.mkdir(parents=True,exist_ok=True)
+          target=windows_folder/'DualBotReadOnlyBridge.mq5'
+          target.write_text(code,encoding='utf-8')
+          wine='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          metaeditor=r'C:\Program Files\MetaTrader 5\metaeditor64.exe'
+          win_source=r'C:\DualBotBridge14\DualBotReadOnlyBridge.mq5'
+          print('MQL5_SOURCE_IN_WINE_PREFIX=',target.is_file())
+          print('MQL5_SOURCE_BYTES=',target.stat().st_size)
+          # MetaQuotes documents the /compile:<Windows path> and /log switches.
+          # This short Windows filename avoids ambiguous quoting of the /compile argument.
+          choices=[
+              ('short_absolute',[wine,metaeditor,'/compile:'+win_source,'/log']),
+              ('short_quoted',[wine,metaeditor,'/compile:"'+win_source+'"','/log']),
+          ]
+          compiled=target.with_suffix('.ex5'); log=target.with_suffix('.log')
+          for tag,cmd in choices:
+              for f in (compiled,log):
+                  try: f.unlink()
+                  except FileNotFoundError: pass
+              print('METAEDITOR_COMPILER_ATTEMPT=',tag,flush=True)
+              try:
+                  proc=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                              text=True,errors='replace',timeout=80,env=os.environ.copy())
+                  print('METAEDITOR_EXIT_CODE=',proc.returncode,flush=True)
+                  print('METAEDITOR_STDOUT_PRESENT=',bool(proc.stdout.strip()))
+                  print('METAEDITOR_STDERR_PRESENT=',bool(proc.stderr.strip()))
+                  # No raw process text to avoid accidental environment leakage.
+              except subprocess.TimeoutExpired:
+                  print('METAEDITOR_COMPILER_TIMED_OUT=YES',flush=True)
+              for _ in range(5):
+                  if compiled.is_file() or log.is_file(): break
+                  time.sleep(2)
+              print('COMPILER_LOG_PRESENT=',log.is_file(),flush=True)
+              if log.is_file():
+                  raw=log.read_bytes()
+                  msg=raw.decode('utf-16le' if raw.count(b'\x00')>len(raw)//8 else 'utf-8',errors='replace')
+                  print('COMPILER_LAST_LINES=',json.dumps(msg.splitlines()[-12:])[:3000],flush=True)
+              if compiled.is_file() and compiled.stat().st_size>=500:
+                  print('MQL5_EX5_COMPILED=YES',flush=True)
+                  break
+          else:
+              # Diagnostic only: report filenames, not logs containing account information.
+              candidates=[prefix/'drive_c/Program Files/MetaTrader 5/MQL5/Experts']
+              candidates.extend((prefix/'drive_c/users').glob('*/AppData/Roaming/MetaQuotes/Terminal/*/MQL5/Experts'))
+              for folder in candidates:
+                  for match in list(folder.glob('*DualBotReadOnlyBridge*'))[:4]:
+                      if match.suffix.lower() in {'.mq5','.log','.ex5'}:
+                          print('COMPILER_ALT_FILE=',match.suffix,match.stat().st_size,flush=True)
+              raise SystemExit('MQL5_COMPILATION_NOT_VERIFIED: MetaEditor did not produce expected .ex5; inspect console diagnostics')
+          # Copy compiled EA to the terminal installation and every detected user data folder.
+          install=prefix/'drive_c/Program Files/MetaTrader 5/MQL5/Experts'
+          install.mkdir(parents=True,exist_ok=True)
+          shutil.copy2(compiled,install/compiled.name)
+          deriv_experts=prefix/'drive_c/DerivMT5Test19/MQL5/Experts'
+          deriv_experts.mkdir(parents=True,exist_ok=True)
+          shutil.copy2(compiled,deriv_experts/compiled.name)
+          print('TEST19_DERIV_PORTABLE_EA_COPIED=YES',flush=True)
+          count=0
+          for folder in (prefix/'drive_c/users').glob('*/AppData/Roaming/MetaQuotes/Terminal/*/MQL5/Experts'):
+              folder.mkdir(parents=True,exist_ok=True)
+              shutil.copy2(compiled,folder/compiled.name)
+              count+=1
+          print('MQL5_COMPILED_EA_COPIED_TO_DATA_FOLDERS=',count)
+          PY_COMPILE
+      - name: Launch MT5 with existing disposable Deriv demo secrets and read-only bridge
+        shell: bash
+        timeout-minutes: 4
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5" WINEDEBUG=-all
+          cat > "$RUNNER_TEMP/read_bridge.py" <<'BRIDGE_SOURCE_EOF'
+          """Read-only MQL5 FILE_COMMON CSV bridge for a native macOS Python process.
+
+          No broker credentials, no Python MetaTrader5 extension, no order methods.
+          Never use a snapshot as a trading signal without stale-data safeguards.
+          """
+          import csv
+          import os
+          from pathlib import Path
+          from typing import Optional
+
+          FILENAME = "DUALBOT_TEST14_BRIDGE.csv"
+          REQUIRED_FIELDS = (
+              "run_id", "seq", "terminal_connected", "demo_account",
+              "quotes_available", "symbol", "bid", "ask", "tick_unix_seconds", "orders_sent", "account_login", "account_server", "terminal_build",
+          )
+
+
+          def candidates(prefix: Path):
+              """FILE_COMMON lives under the Wine user's MetaQuotes Terminal/Common/Files."""
+              yield from prefix.glob(f"drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files/{FILENAME}")
+              yield from prefix.glob(f"drive_c/users/*/Application Data/MetaQuotes/Terminal/Common/Files/{FILENAME}")
+              # Do not use a non-common MQL5/Files file: it would not prove FILE_COMMON.
+
+
+          def parse_snapshot(path: Path, expected_run_id: Optional[str] = None) -> dict:
+              with open(path, "r", newline="", encoding="utf-8-sig") as fh:
+                  rows = list(csv.DictReader(fh, delimiter=";"))
+              if len(rows) != 1:
+                  raise ValueError("Expected exactly one snapshot row")
+              row = rows[0]
+              if not all(key in row for key in REQUIRED_FIELDS):
+                  raise ValueError("Missing fields in snapshot")
+              if expected_run_id is not None and row["run_id"] != expected_run_id:
+                  raise ValueError("Snapshot belongs to another workflow run")
+              for key in ("seq", "terminal_connected", "demo_account", "quotes_available", "tick_unix_seconds", "orders_sent", "account_login", "terminal_build"):
+                  row[key] = int(row[key])
+              for key in ("bid", "ask"):
+                  row[key] = float(row[key])
+              if row["seq"] <= 0:
+                  raise ValueError("Snapshot sequence not positive")
+              if row["orders_sent"] != 0:
+                  raise ValueError("Read-only safety check failed")
+              if row["quotes_available"] and not (row["terminal_connected"] and 0 < row["bid"] < row["ask"]):
+                  raise ValueError("Invalid quote flags or spread")
+              return row
+
+
+          def find_snapshot(prefix: Path, expected_run_id: str) -> dict:
+              for path in candidates(prefix):
+                  if path.is_file():
+                      try:
+                          return parse_snapshot(path, expected_run_id)
+                      except (OSError, ValueError, UnicodeDecodeError):
+                          continue
+              raise FileNotFoundError("No matching FILE_COMMON snapshot found")
+
+
+          def sanitized_report(snapshot: dict) -> dict:
+              """No account IDs, server names or full quotes printed to public CI logs."""
+              return {
+                  "bridge_file_seen": True,
+                  "run_id_matches": True,
+                  "heartbeat_seq": snapshot["seq"],
+                  "terminal_connected": bool(snapshot["terminal_connected"]),
+                  "demo_account": bool(snapshot["demo_account"]),
+                  "quotes_available": bool(snapshot["quotes_available"]),
+                  "symbol_nonempty": bool(snapshot["symbol"]),
+                  "account_login_present": snapshot["account_login"] > 0,
+                  "account_server_present": bool(snapshot["account_server"]),
+                  "terminal_build": snapshot["terminal_build"],
+                  "orders_sent": snapshot["orders_sent"],
+              }
+
+
+          if __name__ == "__main__":
+              import json
+              prefix = Path(os.environ["WINEPREFIX"])
+              run_id = os.environ["BRIDGE_RUN_ID"]
+              print(json.dumps(sanitized_report(find_snapshot(prefix, run_id)), sort_keys=True))
+          BRIDGE_SOURCE_EOF
+          python3 - <<'PY_LAUNCH'
+          import os, signal, subprocess, time
+          from pathlib import Path
+          prefix=Path(os.environ['WINEPREFIX'])
+          login=os.environ.get('MT5_DEMO_LOGIN','')
+          pwd=os.environ.get('MT5_DEMO_PASSWORD','')
+          server=os.environ.get('MT5_DEMO_SERVER','')
+          # Missing secrets should be visible without exposing their values.
+          complete=bool(login and pwd and server)
+          if not complete:
+              raise SystemExit('MISSING_DISPOSABLE_DEMO_SECRETS: configure MT5_DEMO_LOGIN/PASSWORD/SERVER in GitHub Actions Secrets')
+          if not login.isdecimal() or not server.strip() or any(('\r' in x or '\n' in x or '\x00' in x) for x in (login,pwd,server)):
+              raise SystemExit('INVALID_DEMO_SECRET_FORMAT')
+          if 'demo' not in server.lower():
+              raise SystemExit('DEMO_ONLY_GUARD: server must identify a DEMO account; no real-account testing')
+          ini=prefix/'drive_c/dualbot-test19-demo-readonly.ini'
+          ini.write_text(
+              '[Common]\nLogin='+login+'\nPassword='+pwd+'\nServer='+server+
+              '\nKeepPrivate=0\nProxyEnable=0\n'+
+              '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\nAccount=0\nProfile=0\n'+
+              '[StartUp]\nExpert=DualBotReadOnlyBridge\nSymbol=EURUSD\nPeriod=M1\n',
+              encoding='utf-8')
+          ini.chmod(0o600)
+          print('TEST19_DISPOSABLE_DEMO_SECRETS_PRESENT=YES',flush=True)
+          print('TEST19_SERVER_FORMAT='+('EXPLICIT_ADDRESS' if '.' in server or ':' in server else 'BROKER_ALIAS'),flush=True)
+          # Count server registry files (never print filenames/contents).
+          registries=list(prefix.rglob('*.srv'))
+          print('TEST19_SRV_FILES_PRESENT='+str(bool(registries)).upper(),flush=True)
+          # servers.dat, rather than *.srv, is part of the documented MT5 config layout.
+          # Its existence does NOT demonstrate that this specific broker is registered.
+          dat_files=list(prefix.rglob('servers.dat'))
+          print('TEST19_SERVERS_DAT_PRESENT='+str(bool(dat_files)).upper(),flush=True)
+          from configparser import ConfigParser
+          checked=ConfigParser(interpolation=None)
+          checked.optionxform=str
+          checked.read(ini,encoding='utf-8')
+          exact=bool(checked.has_section('Common') and checked.get('Common','Login',fallback='')==login and
+                     checked.get('Common','Password',fallback='')==pwd and
+                     checked.get('Common','Server',fallback='')==server and
+                     checked.get('Experts','AllowLiveTrading',fallback='')=='0' and
+                     checked.get('StartUp','Expert',fallback='')=='DualBotReadOnlyBridge')
+          print('TEST19_CONFIG_CONTENTS_MATCH_GITHUB_SECRETS='+str(exact).upper(),flush=True)
+          if not exact:
+              raise SystemExit('FAIL: written startup configuration does not match the intended demo secrets')
+          # Deriv supplied an alias, but this default MetaQuotes terminal may not
+          # know its access points unless the broker was discovered through MT5 UI.
+          print('TEST19_UNDISCOVERED_ALIAS_CANDIDATE='+str(not ('.' in server or ':' in server) and not bool(registries or dat_files)).upper(),flush=True)
+          ps=subprocess.run(['ps','-axo','pid=,command='],capture_output=True,text=True,check=True).stdout
+          for entry in ps.splitlines():
+              try: pid,cmd=entry.strip().split(None,1)
+              except ValueError: continue
+              cmd=cmd.lower()
+              if 'terminal64.exe' in cmd and ('wine' in cmd or 'metatrader' in cmd):
+                  try: os.kill(int(pid),signal.SIGTERM)
+                  except (OSError,ValueError): pass
+          time.sleep(5)
+          wine='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          exe=r'C:\DerivMT5Test19\terminal64.exe'
+          subprocess.Popen([wine,exe,r'/config:C:\dualbot-test19-demo-readonly.ini','/portable'],
+                  env=os.environ.copy(),stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,start_new_session=True)
+          print('TEST19_TERMINAL_LAUNCHED=YES',flush=True)
+          PY_LAUNCH
+      - name: Verify actual MT5 build, broker TCP, Deriv authorization and live quotes
+        shell: bash
+        timeout-minutes: 7
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          export BRIDGE_RUN_ID="$GITHUB_RUN_ID"
+          python3 - <<'PY_WATCH'
+          import json,os,re,sys,time,subprocess,socket
+          from collections import Counter
+          from pathlib import Path
+          sys.path.insert(0,os.environ['RUNNER_TEMP'])
+          from read_bridge import find_snapshot, sanitized_report
+          prefix=Path(os.environ['WINEPREFIX']); run_id=os.environ['BRIDGE_RUN_ID']
+          expected_login=os.environ.get('MT5_DEMO_LOGIN','')
+          expected_server=os.environ.get('MT5_DEMO_SERVER','')
+          result={'test':'19','platform':'macos-26-arm64','mql5_ex5_compiled':True,
+                  'mt5_python_ipc_used':False,'orders_sent':0,'bridge_file_seen':False,
+                  'demo_connected':False,'expected_demo_account_verified':False,
+                  'fresh_market_quote_verified':False,'terminal_connected':False,
+                  'journal_flags':{},'journal_files_found':False,
+                  'account_login_loaded':False,'account_login_matches_secret':False,
+                  'account_server_loaded':False,'account_server_matches_secret':False,
+                  'srv_registry_files_present':False,'servers_dat_present':False,
+                  'server_config_format':'unknown',
+                  'network':{'wine_process_seen':False,'lsof_probe_usable':False,
+                      'wine_remote_tcp_seen':False,'wine_tcp_established_seen':False,
+                      'wine_tcp_syn_sent_seen':False,'tcp_state_counts':{},
+                      'samples_with_wine_process':0},
+                  'official_release_reference_build':6286,
+                  'terminal_build_below_reference':False}
+          transfer_path=Path(os.environ['RUNNER_TEMP'])/'test19_transfer_report.json'
+          result['transfer']=json.loads(transfer_path.read_text())
+          result['windows_expected_build']=int(result['transfer']['windows_build_expected'])
+          # lsof output is inspected locally; NEVER print or upload IPs, hostnames or ports.
+          tcp_counts=Counter()
+          def probe_wine_sockets():
+              listing=subprocess.run(['ps','-axo','pid=,command='],capture_output=True,text=True,timeout=8)
+              if listing.returncode!=0:
+                  return
+              pids=[]
+              for line in listing.stdout.splitlines():
+                  try: pid,cmd=line.strip().split(None,1)
+                  except ValueError: continue
+                  low=cmd.lower()
+                  if ('terminal64.exe' in low or 'wineserver' in low or 'wine64' in low or
+                      'metaeditor64.exe' in low) and pid.isdecimal():
+                      pids.append(pid)
+              if not pids:
+                  return
+              result['network']['wine_process_seen']=True
+              result['network']['samples_with_wine_process']+=1
+              # -a intersects PID and TCP filters on macOS; nonzero lsof may mean no sockets.
+              p=subprocess.run(['lsof','-a','-nP','-iTCP','-p',','.join(pids[:35])],
+                              capture_output=True,text=True,timeout=8)
+              if p.returncode not in (0,1):
+                  return
+              result['network']['lsof_probe_usable']=True
+              for line in p.stdout.splitlines()[1:]:
+                  if '->' not in line: continue  # skip local-only/listening sockets
+                  result['network']['wine_remote_tcp_seen']=True
+                  state=re.search(r'\(([A-Z_]+)\)\s*$',line)
+                  tag=state.group(1) if state else 'UNKNOWN'
+                  if tag not in ('ESTABLISHED','SYN_SENT','SYN_RECV','CLOSE_WAIT',
+                                 'FIN_WAIT_1','FIN_WAIT_2','TIME_WAIT','LAST_ACK','CLOSING'):
+                      tag='OTHER'
+                  tcp_counts[tag]+=1
+                  if tag=='ESTABLISHED':
+                      result['network']['wine_tcp_established_seen']=True
+                  if tag=='SYN_SENT':
+                      result['network']['wine_tcp_syn_sent_seen']=True
+          seen=None
+          for trial in range(100):
+              try:
+                  probe_wine_sockets()
+              except (OSError,subprocess.TimeoutExpired,ValueError):
+                  pass  # a missed socket sample cannot establish network failure
+              try:
+                  snap=find_snapshot(prefix,run_id)
+                  seen=snap
+                  result.update(sanitized_report(snap))
+                  result['bridge_file_seen']=True
+                  matching=bool(expected_login and str(snap['account_login'])==expected_login)
+                  result['account_login_loaded']=bool(snap['account_login']>0)
+                  result['account_login_matches_secret']=matching
+                  result['account_server_loaded']=bool(snap['account_server'])
+                  result['account_server_matches_secret']=bool(expected_server and snap['account_server'].casefold()==expected_server.casefold())
+                  result['expected_demo_account_verified']=bool(matching and snap['demo_account'] and snap['terminal_connected'])
+                  result['demo_connected']=bool(snap['demo_account'] and snap['terminal_connected'])
+                  ts=int(snap['tick_unix_seconds'])
+                  seconds_ago=time.time()-ts
+                  fresh=bool(ts>0 and -60<=seconds_ago<=180)
+                  result['fresh_market_quote_verified']=bool(result['expected_demo_account_verified'] and snap['quotes_available'] and fresh)
+                  if result['fresh_market_quote_verified'] and snap['seq']>=3:
+                      break
+              except (OSError,ValueError,FileNotFoundError,UnicodeDecodeError,KeyError,TypeError):
+                  pass
+              time.sleep(2)
+          result['network']['tcp_state_counts']=dict(tcp_counts)
+          result['terminal_build_below_reference']=bool(result.get('terminal_build',0)>0 and
+                                                   result['terminal_build']<result['official_release_reference_build'])
+          # Read MT5 journal files only locally. Convert to strictly fixed, nonsecret booleans.
+          # Never upload or print raw journal lines, broker server names, account IDs, or quotes.
+          folders=[prefix/'drive_c/Program Files/MetaTrader 5/logs']
+          folders.extend((prefix/'drive_c/users').glob('*/AppData/Roaming/MetaQuotes/Terminal/*/logs'))
+          folders.extend((prefix/'drive_c/users').glob('*/Application Data/MetaQuotes/Terminal/*/logs'))
+          files=[]
+          for folder in folders:
+              if folder.is_dir():
+                  files.extend(folder.glob('*.log'))
+          result['journal_files_found']=bool(files)
+          result['server_config_format']=('explicit_address' if ('.' in expected_server or ':' in expected_server) else 'broker_alias')
+          result['srv_registry_files_present']=bool(list(prefix.rglob('*.srv')))
+          dat_files=list(prefix.rglob('servers.dat'))
+          result['servers_dat_present']=bool(dat_files)
+          # Check whether the configured alias appears as plaintext in metadata.
+          # A negative result is inconclusive because MT5 may encode/encrypt its registry.
+          result['servers_dat_mentions_alias_plaintext']=False
+          alias_ascii=expected_server.casefold().encode('utf-8',errors='ignore')
+          alias_utf16=expected_server.casefold().encode('utf-16le',errors='ignore')
+          for dat in dat_files[:8]:
+              try:
+                  raw=dat.read_bytes()[:4_000_000]
+                  result['servers_dat_mentions_alias_plaintext'] |= bool(alias_ascii and (
+                      alias_ascii in raw.lower() or alias_utf16 in raw.lower()))
+              except OSError: pass
+          # 'servers.dat' and .srv are configuration indicators, not direct proof of broker discovery.
+          result['alias_without_detected_registry']=bool(result['server_config_format']=='broker_alias' and
+                 not (result['srv_registry_files_present'] or result['servers_dat_present']))
+          flags={'old_version':False,'authorization_failed':False,'invalid_account':False,
+                 'account_disabled':False,'server_unavailable':False,
+                 'network_or_proxy_issue':False,'server_connection_attempted':False,
+                  'configuration_error':False,'broker_discovery':False}
+          for f in sorted(files,key=lambda p:p.stat().st_mtime,reverse=True)[:20]:
+              try:
+                  with f.open('rb') as stream:
+                      stream.seek(0,2); stream.seek(max(0,stream.tell()-262144))
+                      data=stream.read()
+                  enc='utf-16le' if data.count(b'\x00')>len(data)//8 else 'utf-8'
+                  txt=data.decode(enc,errors='replace').lower()
+                  flags['old_version'] |= 'old version' in txt or 'outdated version' in txt
+                  flags['authorization_failed'] |= any(k in txt for k in ('authorization failed','authentication failed','login failed','failed to authorize','authorization error'))
+                  flags['invalid_account'] |= any(k in txt for k in ('invalid account','invalid login','invalid password','incorrect password'))
+                  flags['account_disabled'] |= any(k in txt for k in ('account disabled','account is disabled','account blocked'))
+                  flags['server_unavailable'] |= any(k in txt for k in ('server not found','no access point','unknown server','failed to connect to server','servers.dat'))
+                  flags['network_or_proxy_issue'] |= any(k in txt for k in ('proxy error','network error','connection timed out','no connection'))
+                  flags['server_connection_attempted'] |= any(k in txt for k in ('connecting to','connected to','authorization on','authorization failed'))
+                  flags['configuration_error'] |= any(k in txt for k in ('configuration file','incorrect parameter','invalid config'))
+                  flags['broker_discovery'] |= any(k in txt for k in ('scanning network','search for broker','searching for broker','broker search','server scan'))
+              except (OSError,ValueError):
+                  pass
+          result['journal_flags']=flags
+          # Derived booleans never include any credential or server value.
+          Path('mt5_test19_safe_report.json').write_text(json.dumps(result,sort_keys=True,indent=2)+'\n',encoding='utf-8')
+          print('TEST19_SAFE_RESULT='+json.dumps(result,sort_keys=True),flush=True)
+          if not result['bridge_file_seen']:
+              raise SystemExit('FAIL: Deriv application read-only MQL5 bridge snapshot not detected')
+          if result.get('terminal_build',0)<result['transfer']['windows_build_expected']:
+              raise SystemExit('NOT_VERIFIED: running Mac Deriv terminal did not report the transferred build or newer')
+          if result.get('heartbeat_seq',0)<2:
+              raise SystemExit('FAIL: read-only MQL5 heartbeat did not advance')
+          print('PASS: Read-only MQL5 -> native macOS Python data bridge',flush=True)
+          print('TEST19_ACCOUNT_LOGIN_LOADED='+str(result['account_login_loaded']).upper(),flush=True)
+          print('TEST19_LOGIN_MATCHES_EXPECTED='+str(result['account_login_matches_secret']).upper(),flush=True)
+          print('TEST19_ACCOUNT_SERVER_LOADED='+str(result['account_server_loaded']).upper(),flush=True)
+          print('TEST19_SERVER_MATCHES_EXPECTED='+str(result['account_server_matches_secret']).upper(),flush=True)
+          print('TEST19_SERVER_METADATA_MISSING='+str(result['alias_without_detected_registry']).upper(),flush=True)
+          print('TEST19_WINE_OUTBOUND_TCP_OBSERVED='+str(result['network']['wine_remote_tcp_seen']).upper(),flush=True)
+          print('TEST19_WINE_TCP_ESTABLISHED_OBSERVED='+str(result['network']['wine_tcp_established_seen']).upper(),flush=True)
+          print('TEST19_TERMINAL_BELOW_REFERENCE_BUILD='+str(result['terminal_build_below_reference']).upper(),flush=True)
+          print('TEST19_EFFECTIVE_TERMINAL_BUILD='+str(result.get('terminal_build',0)),flush=True)
+          print('TEST19_NEW_DERIV_BUILD_RUNNING='+str(result.get('terminal_build',0)>=result['transfer']['windows_build_expected']).upper(),flush=True)
+          if not result['expected_demo_account_verified']:
+              raise SystemExit('NOT_VERIFIED: Deriv demo disconnected; inspect build age, sanitized Wine TCP states, and server discovery flags')
+          if not result['fresh_market_quote_verified']:
+              raise SystemExit('NOT_VERIFIED: target Deriv demo is connected but there is no fresh positive bid/ask quote from the bridge')
+          print('PASS: target Deriv demo authenticated with fresh quote via read-only native Mac bridge; no orders sent',flush=True)
+          PY_WATCH
+      - name: Upload sanitized report even if broker login fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MT5_TEST19_BROKER_NETWORK_DIAGNOSTICS
+          path: mt5_test19_safe_report.json
+          if-no-files-found: warn
+          retention-days: 3
+
+  deriv-branded-windows-terminal:
+    runs-on: windows-2025
+    timeout-minutes: 18
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect Deriv-official Windows installer for a current terminal (NO LOGIN, NO TRADES)
+        shell: pwsh
+        timeout-minutes: 9
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:RUNNER_TEMP 'deriv5setup.exe'
+          $dest = 'C:\DerivMT5Probe18'
+          $report = [ordered]@{
+            official_deriv_installer_downloaded = $false
+            installer_started = $false
+            installer_timed_out = $false
+            installer_completed = $false
+            terminal_file_found = $false
+            terminal_file_build = $null
+            server_registry_files_found = $false
+            trades_sent = 0
+          }
+          try {
+            # Official executable linked on Deriv's desktop download page.
+            Invoke-WebRequest 'https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe' -OutFile $exe -TimeoutSec 110
+            $report.official_deriv_installer_downloaded = ((Get-Item $exe).Length -gt 100000)
+          } catch { }
+          if ($report.official_deriv_installer_downloaded) {
+            try {
+              New-Item -ItemType Directory -Force -Path $dest | Out-Null
+              $p = Start-Process -FilePath $exe -ArgumentList ('/auto /path:"' + $dest + '"') -PassThru -WindowStyle Hidden
+              $report.installer_started = $true
+              try {
+                Wait-Process -Id $p.Id -Timeout 180 -ErrorAction Stop
+                $p.Refresh()
+                $report.installer_completed = $p.HasExited
+              } catch {
+                $report.installer_timed_out = $true
+                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              }
+            } catch { }
+          }
+          $candidates = @($dest,'C:\Program Files\Deriv MT5','C:\Program Files\MetaTrader 5')
+          foreach ($folder in $candidates) {
+            if (-not (Test-Path $folder)) { continue }
+            $binary = Get-ChildItem -Path $folder -Filter 'terminal64.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $binary) {
+              $report.terminal_file_found = $true
+              $report.terminal_file_build = $binary.VersionInfo.FileVersion
+              $srv = Get-ChildItem -Path $folder -Include 'servers.dat','*.srv' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              $report.server_registry_files_found = $null -ne $srv
+              break
+            }
+          }
+          Write-Host ('TEST19_WINDOWS_DERIV_REPORT=' + ($report | ConvertTo-Json -Compress))
+          $report | ConvertTo-Json -Depth 4 | Out-File -FilePath (Join-Path $env:GITHUB_WORKSPACE 'test19_windows_safe_report.json') -Encoding utf8
+      - name: Package clean Deriv installation for isolated Mac Wine test
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @('C:\DerivMT5Probe18','C:\Program Files\Deriv MT5','C:\Program Files\MetaTrader 5')
+          $root = $null
+          foreach ($dir in $candidates) {
+            $exe = Join-Path $dir 'terminal64.exe'
+            if (Test-Path $exe) { $root = $dir; break }
+          }
+          if ($null -eq $root) { throw 'TEST19_DERIV_TERMINAL_NOT_INSTALLED' }
+          $terminal = Join-Path $root 'terminal64.exe'
+          $metaeditor = Join-Path $root 'metaeditor64.exe'
+          if (-not (Test-Path $metaeditor)) { throw 'TEST19_METAEDITOR_MISSING' }
+          $build = [int](($((Get-Item $terminal).VersionInfo.FileVersion) -split '\.')[3])
+          if ($build -lt 6200) { throw 'TEST19_DERIV_TERMINAL_TOO_OLD' }
+          $target = Join-Path $env:RUNNER_TEMP 'DerivMT5Test19Transfer'
+          New-Item -ItemType Directory -Path $target -Force | Out-Null
+          $archive = Join-Path $target 'DerivMT5App.zip'
+          # Transfer only the clean program installation, not user AppData, accounts or credentials.
+          Compress-Archive -Path (Join-Path $root '*') -DestinationPath $archive -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $exeHash = (Get-FileHash -Path $terminal -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{ build=$build; archive_sha256=$hash; terminal_sha256=$exeHash }
+          $manifest | ConvertTo-Json -Compress | Set-Content -Path (Join-Path $target 'manifest.json') -Encoding utf8
+          Write-Host ('TEST19_WINDOWS_TRANSFER_BUILD=' + $build)
+          Write-Host ('TEST19_WINDOWS_TRANSFER_ARCHIVE_BYTES=' + (Get-Item $archive).Length)
+      - name: Transfer clean app files to same-run Apple Silicon job (one-day retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MT5_TEST19_WINDOWS_APP_TRANSFER
+          path: ${{ runner.temp }}/DerivMT5Test19Transfer/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Upload sanitized Windows Deriv build inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MT5_TEST19_WINDOWS_DERIV_VERSION
+          path: test19_windows_safe_report.json
+          if-no-files-found: warn
+          retention-days: 3
