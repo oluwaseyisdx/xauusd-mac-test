@@ -61,7 +61,7 @@ jobs:
             open -a 'MetaTrader 5' || true
             sleep 20
             test -d '/Applications/MetaTrader 5.app'
-            python3 - <<'PY'
+            python3 - \<<'PY'
             import json
             from pathlib import Path
             Path('verification_reports/gui_readiness.json').write_text(json.dumps({
