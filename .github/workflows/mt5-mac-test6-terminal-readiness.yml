@@ -1,0 +1,237 @@
+name: MT5 Mac - terminal startup and IPC readiness diagnostics (NO TRADES)
+
+on:
+  push:
+    paths:
+      - .github/workflows/mt5-mac-test6-terminal-readiness.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  terminal-readiness:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Verify ARM64 macOS and prepare Rosetta
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          sw_vers
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+
+      - name: Install official MetaTrader 5 macOS package
+        shell: bash
+        timeout-minutes: 14
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mt5pkg"
+          curl --fail --location --show-error --silent --retry 2 --connect-timeout 20 --max-time 240 \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            --output "$RUNNER_TEMP/MetaTrader5.pkg.zip"
+          ditto -x -k "$RUNNER_TEMP/MetaTrader5.pkg.zip" "$RUNNER_TEMP/mt5pkg"
+          pkg="$(find "$RUNNER_TEMP/mt5pkg" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          sudo installer -pkg "$pkg" -target /
+          test -d '/Applications/MetaTrader 5.app'
+          open -a 'MetaTrader 5' || true
+          sleep 15
+          test -f "$HOME/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+
+      - name: Set up native ARM64 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare third-party native Python bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-input 'mt5_mac==0.3.0'
+          python - <<'PY'
+          from pathlib import Path
+          import importlib.util
+          spec=importlib.util.find_spec('mt5_mac.bootstrap')
+          if not spec or not spec.origin:
+              raise SystemExit('mt5_mac bootstrap module not found')
+          path=Path(spec.origin)
+          old='https://bootstrap.pypa.io/get-pip.py'
+          source=path.read_text('utf-8')
+          if source.count(old) != 1:
+              raise SystemExit('Upstream mt5_mac code changed; refusing temporary patch')
+          path.write_text(source.replace(old,'https://bootstrap.pypa.io/pip/3.9/get-pip.py'),'utf-8')
+          print('Temporary Python 3.9 bootstrap URL fix installed')
+          PY
+
+      - name: Bootstrap Windows Python inside official MT5 Wine prefix
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import subprocess,sys
+          command='import mt5_mac as mt5; print("first_init",mt5.initialize()); mt5.shutdown()'
+          try:
+              p=subprocess.run([sys.executable,'-c',command],text=True,capture_output=True,timeout=170)
+              print('First run returncode:',p.returncode)
+              print('First run stdout tail:',p.stdout[-500:])
+              print('First run stderr tail:',p.stderr[-700:])
+          except subprocess.TimeoutExpired:
+              print('First run timed out, checking bootstrap files')
+          PY
+          python - <<'PY'
+          from pathlib import Path
+          path=Path.home()/'Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Python39/python39._pth'
+          if not path.is_file(): raise SystemExit('Wine Python bootstrap failed to create path file')
+          lines=path.read_text('utf-8').splitlines()
+          if '#import site' in lines: lines[lines.index('#import site')]='import site'
+          elif 'import site' not in lines: lines.append('import site')
+          if 'Lib\\site-packages' not in lines: lines.insert(-1,'Lib\\site-packages')
+          path.write_text('\n'.join(lines)+'\n','utf-8')
+          print('Repaired embedded Python._pth')
+          PY
+
+      - name: Verify Windows pip and official MetaTrader5 Python module
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          export WINEDEBUG=-all
+          WINE='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          WINPY='C:\Python39\python.exe'
+          test -x "$WINE"
+          if ! "$WINE" "$WINPY" -m pip --version; then
+            curl --fail --location --show-error --silent --retry 2 --max-time 120 \
+              'https://bootstrap.pypa.io/pip/3.9/get-pip.py' \
+              --output "$WINEPREFIX/drive_c/Python39/get-pip.py"
+            "$WINE" "$WINPY" 'C:\Python39\get-pip.py' --no-warn-script-location
+          fi
+          "$WINE" "$WINPY" -m pip --version
+          "$WINE" "$WINPY" -m pip install --disable-pip-version-check --no-input --only-binary=:all: 'MetaTrader5==5.0.6231'
+          "$WINE" "$WINPY" -c 'import MetaTrader5 as mt5; print("Official MT5 Windows Python import PASS",mt5.__version__)'
+
+      - name: Monitor terminal startup process and platform journals
+        shell: bash
+        timeout-minutes: 3
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, re, subprocess, time
+          root=pathlib.Path.home()/'Library/Application Support/net.metaquotes.wine.metatrader5/drive_c'
+          report={'platform':'macOS arm64','trading_orders_sent':0,'monitor_duration_seconds':70,'snapshots':[],
+                  'terminal_log_files':[],'journal_snippets':[],'no_broker_credentials_used':True}
+          def processes():
+              p=subprocess.run(['ps','-axo','pid,ppid,etime,stat,command'],text=True,capture_output=True,timeout=15)
+              return [line[:370] for line in p.stdout.splitlines()
+                      if re.search(r'terminal64\.exe|MetaTrader 5\.app/Contents/MacOS/|wineserver',line,re.I)][:16]
+          def journal_files():
+              # Wine data can be stored in Program Files or AppData/Roaming/MetaQuotes/Terminal.
+              found=[]
+              for p in root.rglob('*.log'):
+                  if p.parent.name.lower() in ('logs','crash') and p.is_file():
+                      found.append(p)
+                  if len(found)>=140:break
+              return sorted(found,key=lambda p:p.stat().st_mtime,reverse=True)[:8]
+          for n in range(8):
+              procs=processes()
+              try: logs=journal_files()
+              except Exception: logs=[]
+              report['snapshots'].append({'seconds_since_monitor_start':n*10,
+                 'terminal_process_observed':any('terminal64.exe' in x for x in procs),
+                 'relevant_processes':procs[:8], 'journal_file_count':len(logs)})
+              print('STARTUP_CHECK:',json.dumps(report['snapshots'][-1]),flush=True)
+              if n<7:time.sleep(10)
+          report['terminal_running_at_end']=report['snapshots'][-1]['terminal_process_observed']
+          try: logs=journal_files()
+          except Exception: logs=[]
+          for p in logs:
+              relative=str(p.relative_to(root))
+              report['terminal_log_files'].append(relative)
+              try:
+                  with p.open('rb') as f:
+                      f.seek(0,2); size=f.tell()
+                      f.seek(max(0,size-24000)); data=f.read(24000)
+                  if data.startswith((b'\xff\xfe',b'\xfe\xff')) or data.count(b'\x00')>len(data)//8:
+                      content=data.decode('utf-16-le',errors='replace')
+                  else:
+                      content=data.decode('utf-8-sig',errors='replace')
+                  # Public repository: avoid capturing account numbers or credentials.
+                  lines=[]
+                  for line in content.splitlines()[-22:]:
+                      line=re.sub(r'\b\d{6,12}\b','[ID]',line)
+                      line=re.sub(r'(?i)(password|token|secret|api[_ -]?key)(\s*[:=]\s*)\S+',r'\1\2[REDACTED]',line)
+                      line=re.sub(r'[\w.+-]+@[\w.-]+','[EMAIL]',line)
+                      lines.append(line[-300:])
+                  report['journal_snippets'].append({'file':relative,'last_lines':lines[-12:]})
+              except Exception as exc:
+                  report['journal_snippets'].append({'file':relative,'decode_error':type(exc).__name__})
+          # A process existing does not prove the terminal is initialized or GUI usable.
+          report['terminal_ready_confirmed']=False
+          pathlib.Path('mt5_test6_startup.json').write_text(json.dumps(report,indent=2)+'\n')
+          print('JOURNAL_DIAGNOSTICS',json.dumps(report['journal_snippets'])[:14000])
+          PY
+
+      - name: Retry direct Windows MT5 IPC and capture official last_error
+        shell: bash
+        timeout-minutes: 4
+        run: |
+          python - <<'PY'
+          import json,os,pathlib,subprocess
+          prefix=pathlib.Path.home()/'Library/Application Support/net.metaquotes.wine.metatrader5'
+          winpy=prefix/'drive_c/Python39'
+          test=winpy/'test6_ipc.py'
+          test.write_text(r"""
+          import json,MetaTrader5 as mt5
+          out={'terminal_initialized':False,'orders_sent':0}
+          try:
+              out['terminal_initialized']=bool(mt5.initialize(r'C:\Program Files\MetaTrader 5\terminal64.exe', timeout=25000))
+              out['last_error']=list(mt5.last_error())
+              if out['terminal_initialized']:
+                  out['terminal_version']=mt5.version()
+                  out['terminal_info_present']=mt5.terminal_info() is not None
+                  out['account_info_present']=mt5.account_info() is not None
+          except Exception as e:out['exception']=type(e).__name__+': '+str(e)[:250]
+          finally:
+              try:mt5.shutdown()
+              except Exception:pass
+          print('TEST6_OFFICIAL_API='+json.dumps(out),flush=True)
+          """,encoding='utf-8')
+          cmd=['/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64',
+               r'C:\Python39\python.exe',r'C:\Python39\test6_ipc.py']
+          result={'terminal_initialized':False,'orders_sent':0}
+          try:
+              proc=subprocess.run(cmd,text=True,capture_output=True,timeout=100,
+                  env={**os.environ,'WINEPREFIX':str(prefix),'WINEDEBUG':'-all'})
+              result['process_returncode']=proc.returncode
+              for line in proc.stdout.splitlines():
+                  if line.startswith('TEST6_OFFICIAL_API='):
+                      result.update(json.loads(line.partition('=')[2]))
+              if 'last_error' not in result:
+                  result['stdout_tail']=proc.stdout[-700:]
+                  result['stderr_tail']=proc.stderr[-700:]
+          except subprocess.TimeoutExpired:
+              result['process_timeout']=True
+          p=pathlib.Path('mt5_test6_startup.json')
+          report=json.loads(p.read_text('utf-8'))
+          report['official_mt5_ipc']=result
+          report['terminal_ready_confirmed']=result.get('terminal_initialized') is True
+          p.write_text(json.dumps(report,indent=2)+'\n')
+          print('TEST6_CONNECTION_RESULT',json.dumps(result))
+          if not report['terminal_ready_confirmed']:
+              raise SystemExit('NOT VERIFIED: official MT5 IPC connection failed despite monitored startup')
+          PY
+
+      - name: Upload safe startup and journal diagnostics even if tests fail
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MT5_MAC_TEST6_STARTUP_JOURNAL_DIAGNOSTICS
+          path: mt5_test6_startup.json
+          if-no-files-found: warn
