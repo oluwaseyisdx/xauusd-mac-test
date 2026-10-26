@@ -1,0 +1,87 @@
+# v7: Interactive MT5 broker discovery on CircleCI M4 Pro (Apple Silicon).
+# NOT an automated broker login test. Never submits trades or publishes credentials.
+# Access the GUI ONLY through CircleCI's SSH rerun and a VNC-over-SSH tunnel.
+version: 2.1
+
+orbs:
+  macos: circleci/macos@2.5.4
+
+jobs:
+  mac-mt5-gui-debug:
+    macos:
+      xcode: "16.4.0"
+    resource_class: m4pro.medium
+    working_directory: ~/project
+    environment:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - checkout
+      - run:
+          name: Verify Mac, configuration, and private VNC password
+          command: |
+            set -euo pipefail
+            test "$(uname -s)" = Darwin
+            test "$(uname -m)" = arm64
+            test -n "${MAC_VNC_PASSWORD:-}" || { echo 'ERROR: Set MAC_VNC_PASSWORD in CircleCI Project Settings > Environment Variables'; exit 1; }
+            mkdir -p verification_reports
+            python3 -m unittest discover -s tests -v
+            python3 run.py
+            python3 mac_verify.py --require-apple-silicon
+            echo 'APPLE_SILICON_AND_PYTHON=PASS'
+
+      - run:
+          name: Install proven official macOS MT5 package for GUI inspection
+          no_output_timeout: 12m
+          command: |
+            set -euo pipefail
+            if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+              sudo softwareupdate --install-rosetta --agree-to-license
+            fi
+            stage="$(mktemp -d)"
+            curl -fLsS --retry 2 --connect-timeout 25 --max-time 360 \
+              'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+              -o "$stage/MetaTrader5.pkg.zip"
+            mkdir -p "$stage/unpacked"
+            ditto -x -k "$stage/MetaTrader5.pkg.zip" "$stage/unpacked"
+            pkg="$(find "$stage/unpacked" -name '*.pkg' -print -quit)"
+            test -n "$pkg"
+            sudo installer -pkg "$pkg" -target /
+            test -x '/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+            echo 'OFFICIAL_MAC_MT5_INSTALLED=YES'
+
+      - macos/enable-vnc:
+          username: vncuser
+          password: "$MAC_VNC_PASSWORD"
+
+      - run:
+          name: Launch MT5 GUI for interactive Deriv.com Limited broker search
+          no_output_timeout: 5m
+          command: |
+            set -euo pipefail
+            open -a 'MetaTrader 5' || true
+            sleep 20
+            test -d '/Applications/MetaTrader 5.app'
+            python3 - <<'PY'
+            import json
+            from pathlib import Path
+            Path('verification_reports/gui_readiness.json').write_text(json.dumps({
+                'platform':'macOS Apple Silicon',
+                'mac_mt5_package_installed':True,
+                'gui_broker_search_automatically_completed':False,
+                'broker_login_proven':False,
+                'fresh_quotes_proven':False,
+                'trade_orders_submitted_by_workflow':False,
+                'debug_access_requires_ssh_rerun':True,
+            }, indent=2)+'\n', encoding='utf-8')
+            PY
+            echo 'GUI_PREPARED=YES; NOW RERUN JOB WITH SSH, CONNECT USING SSH KEY, AND FORWARD LOCAL PORT 5900'
+            echo 'DO NOT SHARE BROKER CREDENTIALS OR SCREENSHOTS CONTAINING THEM'
+
+      - store_artifacts:
+          path: verification_reports
+          destination: mac-mt5-gui-readiness
+
+workflows:
+  interactive-mt5-broker-discovery:
+    jobs:
+      - mac-mt5-gui-debug
