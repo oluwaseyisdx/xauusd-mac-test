@@ -1,0 +1,77 @@
+# Independent Apple Silicon M2 qualification, NOT a Deriv login or trading test.
+# Store any future demo credentials in Codemagic Secret variables, never here.
+workflows:
+  dualbot-m2-readonly:
+    name: DualBot - Apple Silicon M2 readiness and official MT5 (NO TRADES)
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    scripts:
+      - name: Prove real Apple Silicon and run existing Gold SR tests
+        script: |
+          set -euo pipefail
+          mkdir -p verification_reports
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+          sw_vers
+          python3 -m unittest discover -s tests -v
+          python3 run.py
+          python3 mac_verify.py --require-apple-silicon
+          python3 - <<'PY'
+          import json,platform,pathlib
+          info = {
+              'test': 'Codemagic independent Apple Silicon M2 readiness',
+              'platform': platform.platform(),
+              'machine': platform.machine(),
+              'strategy_tests_complete': True,
+              'native_python_tests_passed': True,
+              'broker_authenticated': False,
+              'live_quotes_verified': False,
+              'python_to_deriv_mt5_bridge_verified': False,
+              'real_or_demo_order_sent': False,
+          }
+          pathlib.Path('verification_reports/mac_strategy.json').write_text(json.dumps(info,indent=2)+'\n')
+          print('MAC_READINESS=',json.dumps(info,sort_keys=True))
+          PY
+      - name: Install MetaQuotes official macOS MT5 (bundled Wine)
+        script: |
+          set -euo pipefail
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          STAGE="$(mktemp -d)"
+          curl -fLsS --retry 2 --connect-timeout 20 --max-time 240 \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' -o "$STAGE/MetaTrader5.pkg.zip"
+          ditto -x -k "$STAGE/MetaTrader5.pkg.zip" "$STAGE/unpacked"
+          PKG="$(find "$STAGE/unpacked" -name '*.pkg' -print -quit)"
+          test -n "$PKG"
+          sudo installer -pkg "$PKG" -target /
+          test -x '/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          open -a 'MetaTrader 5' || true
+          sleep 20
+          test -s "$HOME/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+      - name: Validate MT5 installation and publish honest test scope
+        script: |
+          set -euo pipefail
+          WINE='/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+          "$WINE" --version
+          python3 - <<'PY'
+          import json,platform,pathlib
+          app=pathlib.Path('/Applications/MetaTrader 5.app')
+          terminal=pathlib.Path.home()/'Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Program Files/MetaTrader 5/terminal64.exe'
+          info={
+            'apple_silicon_arm64': platform.machine()=='arm64',
+            'official_mac_mt5_app_present': app.is_dir(),
+            'official_mt5_terminal_executable_present': terminal.is_file(),
+            'deriv_mac_app_tested': False,
+            'deriv_demo_authenticated': False,
+            'deriv_quotes_verified': False,
+            'mql5_to_native_python_bridge_tested_in_this_workflow': False,
+            'order_submissions_enabled': False,
+            'note': 'This is a Mac hardware + strategy + MT5 installation smoke test ONLY; never count it as a passed Deriv trading connection.'
+          }
+          pathlib.Path('verification_reports/mac_mt5_install.json').write_text(json.dumps(info,indent=2)+'\n')
+          print('MAC_MT5_INSTALL=',json.dumps(info,sort_keys=True))
+          assert all([info['apple_silicon_arm64'],info['official_mac_mt5_app_present'],info['official_mt5_terminal_executable_present']])
+          PY
+    artifacts:
+      - verification_reports/*.json
