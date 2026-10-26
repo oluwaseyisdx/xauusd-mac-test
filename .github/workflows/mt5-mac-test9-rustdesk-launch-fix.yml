@@ -1,0 +1,148 @@
+name: MT5 Mac Test 9 - RustDesk actual launch and process verification (NO TRADES)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mt5-mac-test9-rustdesk
+  cancel-in-progress: true
+
+jobs:
+  rustdesk-real-launch:
+    runs-on: macos-15
+    timeout-minutes: 38
+    steps:
+      - name: Verify genuine Apple Silicon and existing password secret
+        shell: bash
+        env:
+          MAC_REMOTE_PASSWORD: ${{ secrets.MAC_REMOTE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          if test "${#MAC_REMOTE_PASSWORD}" -lt 18; then
+            echo 'FAIL: MAC_REMOTE_PASSWORD secret is missing or fewer than 18 characters.'
+            exit 1
+          fi
+          echo 'PASS: Apple Silicon Mac and remote password secret present.'
+          sw_vers
+
+      - name: Install signed official RustDesk 1.5.0 for Apple Silicon
+        shell: bash
+        timeout-minutes: 7
+        run: |
+          set -euo pipefail
+          curl --fail --location --show-error --silent --retry 2 --connect-timeout 20 --max-time 240 \
+            'https://github.com/rustdesk/rustdesk/releases/download/1.5.0/rustdesk-1.5.0-aarch64.dmg' \
+            -o "$RUNNER_TEMP/rustdesk.dmg"
+          mkdir -p "$RUNNER_TEMP/rustdesk-volume"
+          hdiutil attach "$RUNNER_TEMP/rustdesk.dmg" -nobrowse -readonly \
+            -mountpoint "$RUNNER_TEMP/rustdesk-volume"
+          test -d "$RUNNER_TEMP/rustdesk-volume/RustDesk.app"
+          ditto "$RUNNER_TEMP/rustdesk-volume/RustDesk.app" '/Applications/RustDesk.app'
+          hdiutil detach "$RUNNER_TEMP/rustdesk-volume" || true
+          codesign --verify --deep --strict '/Applications/RustDesk.app'
+          BIN_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' '/Applications/RustDesk.app/Contents/Info.plist')"
+          test -x "/Applications/RustDesk.app/Contents/MacOS/$BIN_NAME"
+          echo 'PASS: official signed RustDesk installed; bundle executable exists.'
+          echo "Bundle executable: $BIN_NAME"
+
+      - name: Launch the actual RustDesk executable AND its background server
+        shell: bash
+        timeout-minutes: 4
+        env:
+          MAC_REMOTE_PASSWORD: ${{ secrets.MAC_REMOTE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BIN_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' '/Applications/RustDesk.app/Contents/Info.plist')"
+          BIN="/Applications/RustDesk.app/Contents/MacOS/$BIN_NAME"
+          test -x "$BIN"
+          echo 'Test 8 used open -a RustDesk, which reported Application Not Found. Trying the explicit bundle path.'
+          if open -n '/Applications/RustDesk.app' >/dev/null 2>&1; then
+            echo 'Explicit bundle launch was accepted by macOS.'
+          else
+            echo 'macOS did not accept explicit bundle launch. Trying the verified binary.'
+          fi
+          sleep 5
+          nohup "$BIN" --server > "$RUNNER_TEMP/rustdesk-server.log" 2>&1 < /dev/null &
+          SERVER_PID=$!
+          echo "Server launch PID: $SERVER_PID"
+          nohup "$BIN" > "$RUNNER_TEMP/rustdesk-app.log" 2>&1 < /dev/null &
+          APP_PID=$!
+          echo "App launch PID: $APP_PID"
+          sleep 15
+          # Only disclose the exit code of the password command, never its arguments/output.
+          set +e
+          "$BIN" --password "$MAC_REMOTE_PASSWORD" > "$RUNNER_TEMP/rustdesk-password.log" 2>&1
+          PASSWORD_RESULT=$?
+          set -e
+          echo "RustDesk password configuration exit code: $PASSWORD_RESULT"
+          if test "$PASSWORD_RESULT" -ne 0; then
+            echo 'WARNING: RustDesk could not confirm permanent password setup.'
+          fi
+          RID=''
+          for attempt in 1 2 3; do
+            set +e
+            RAW_ID="$("$BIN" --get-id 2>/dev/null)"
+            ID_CODE=$?
+            set -e
+            if test "$ID_CODE" -eq 0 && [[ "$RAW_ID" =~ ^[A-Za-z0-9_-]{6,24}$ ]]; then
+              RID="$RAW_ID"
+              break
+            fi
+            sleep 5
+          done
+          echo 'RustDesk process listing (executable names only; no credentials):'
+          ps -axo pid=,comm= | grep -i '[R]ustDesk' || true
+          ACTIVE_COUNT="$(ps -axo comm= | grep -ic '[R]ustDesk' || true)"
+          echo "RUSTDESK_ACTIVE_PROCESS_COUNT=$ACTIVE_COUNT"
+          if test -n "$RID"; then
+            echo "RUSTDESK_ID=$RID"
+          else
+            echo 'RUSTDESK_ID_UNAVAILABLE: no verified ID was returned.'
+          fi
+          if test "$ACTIVE_COUNT" -eq 0; then
+            echo 'FAIL: RustDesk has no active process. An ID/password command alone does not make it reachable.'
+            exit 1
+          fi
+          echo 'RustDesk is running as a process. This does NOT confirm external network reachability.'
+          echo 'macOS Screen Recording and Accessibility permissions may still block remote control.'
+
+      - name: Install official MT5 on the same temporary Mac
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mt5-pkg"
+          curl --fail --location --show-error --silent --retry 2 --connect-timeout 20 --max-time 240 \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            -o "$RUNNER_TEMP/mt5-pkg.zip"
+          ditto -x -k "$RUNNER_TEMP/mt5-pkg.zip" "$RUNNER_TEMP/mt5-pkg"
+          PKG="$(find "$RUNNER_TEMP/mt5-pkg" -name '*.pkg' -print -quit)"
+          test -n "$PKG"
+          sudo installer -pkg "$PKG" -target /
+          test -d '/Applications/MetaTrader 5.app'
+          open '/Applications/MetaTrader 5.app' >/dev/null 2>&1 || true
+          echo 'PASS: MT5 package installed. This step does not verify Python/MT5 IPC.'
+
+      - name: Keep diagnostic desktop open while monitoring RustDesk process state
+        shell: bash
+        timeout-minutes: 19
+        run: |
+          set -euo pipefail
+          echo 'CONNECT NOW with new RUSTDESK_ID and existing MAC_REMOTE_PASSWORD.'
+          echo 'If your iPhone says offline, report it; an ID does not guarantee registration.'
+          echo 'Never enter real-money trading credentials on this temporary Mac.'
+          for n in $(seq 1 16); do
+            PROCESS_COUNT="$(ps -axo comm= | grep -ic '[R]ustDesk' || true)"
+            echo "RUSTDESK_HEARTBEAT=$n/16 active_processes=$PROCESS_COUNT"
+            if test "$PROCESS_COUNT" -eq 0; then
+              echo 'FAIL: RustDesk stopped running.'
+              exit 1
+            fi
+            sleep 60
+          done
+          echo 'Diagnostic holding period completed; GitHub will now dispose of the temporary Mac.'
