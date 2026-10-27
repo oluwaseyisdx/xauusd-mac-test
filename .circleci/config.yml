@@ -1,0 +1,112 @@
+# v8: Mac MT5 demo GUI with read-only, prepared two-way Python bridge.
+# The automated probe NEVER trades or outputs credentials.
+version: 2.1
+orbs:
+  macos: circleci/macos@2.5.4
+
+jobs:
+  mac-mt5-gui-debug:
+    macos:
+      xcode: "16.4.0"
+    resource_class: m4pro.medium
+    working_directory: ~/project
+    environment:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - checkout
+      - run:
+          name: Verify Apple Silicon, trading strategy tests, and private VNC setup
+          command: |
+            set -euo pipefail
+            test "$(uname -s)" = Darwin
+            test "$(uname -m)" = arm64
+            test -n "${MAC_VNC_PASSWORD:-}" || { echo 'ERROR: Set MAC_VNC_PASSWORD in CircleCI Project Settings'; exit 1; }
+            mkdir -p verification_reports
+            python3 -m unittest discover -s tests -v
+            python3 run.py
+            python3 mac_verify.py --require-apple-silicon
+            echo 'APPLE_SILICON_STRATEGY_TESTS=PASS'
+      - run:
+          name: Install verified official MetaQuotes MT5 Mac package
+          no_output_timeout: 12m
+          command: |
+            set -euo pipefail
+            if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+              sudo softwareupdate --install-rosetta --agree-to-license
+            fi
+            stage="$(mktemp -d)"
+            # This download is public; fail closed on TLS/certificate errors.
+            # Use mirrors named in official MetaQuotes release notes and an
+            # MT5 broker's public Mac installer instructions.
+            package_zip="$stage/MetaTrader5.pkg.zip"
+            downloaded=no
+            for url in \
+              'https://download.terminal.free/cdn/web/metaquotes.ltd/mt5/MetaTrader5.pkg.zip' \
+              'https://download.terminal.free/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+              'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip'; do
+              echo "TRYING_METATRADER_SOURCE=$url"
+              if curl --fail --location --silent --show-error --retry 2 \
+                  --connect-timeout 25 --max-time 360 \
+                  --proto '=https' --proto-redir '=https' \
+                  "$url" -o "$package_zip"; then
+                if test -s "$package_zip" && unzip -tqq "$package_zip"; then
+                  downloaded=yes
+                  echo 'MT5_HTTPS_DOWNLOAD_AND_ZIP_VALIDATION=PASS'
+                  break
+                fi
+                echo 'DOWNLOADED_FILE_NOT_VALID_ZIP; TRYING_NEXT_SOURCE'
+              else
+                echo 'DOWNLOAD_OR_TLS_VALIDATION_FAILED; TRYING_NEXT_SOURCE'
+              fi
+              rm -f "$package_zip"
+            done
+            if test "$downloaded" != yes; then
+              echo 'ERROR: All MetaTrader HTTPS sources failed. Do not disable TLS verification.'
+              exit 1
+            fi
+            mkdir -p "$stage/unpacked"
+            ditto -x -k "$stage/MetaTrader5.pkg.zip" "$stage/unpacked"
+            pkg="$(find "$stage/unpacked" -name '*.pkg' -print -quit)"
+            test -n "$pkg"
+            # Ensure a trusted installer signature before executing the package.
+            if ! pkgutil --check-signature "$pkg" > "$stage/package_signature.txt" 2>&1; then
+              echo 'ERROR: Installer signature is missing or not trusted.'
+              exit 1
+            fi
+            if ! grep -Eiq 'MetaQuotes' "$stage/package_signature.txt"; then
+              echo 'ERROR: Installer signer could not be identified as MetaQuotes.'
+              exit 1
+            fi
+            echo 'MT5_SIGNED_INSTALLER_VALIDATION=PASS'
+            sudo installer -pkg "$pkg" -target /
+            open -a 'MetaTrader 5' || true
+            sleep 25
+            test -x '/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin/wine64'
+            test -s "$HOME/Library/Application Support/net.metaquotes.wine.metatrader5/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+            echo 'OFFICIAL_MAC_MT5_INSTALLED=YES'
+      - macos/enable-vnc:
+          username: vncuser
+          password: MAC_VNC_PASSWORD
+      - run:
+          name: Auto-compile, install EA in active Wine data folders, and test PING STATUS
+          no_output_timeout: 12m
+          command: |
+            set -euo pipefail
+            python3 .circleci/dualbot_mac_bootstrap_v8.py --prepare
+            echo 'AUTO_BRIDGE_PREPARED=YES; DETAILS_IN_ARTIFACT'
+      - run:
+          name: Keep MT5 desktop available for Deriv.com Limited interactive demo login
+          command: |
+            set -euo pipefail
+            open -a 'MetaTrader 5' || true
+            echo 'MAC_DESKTOP_READY=YES; USE_RERUN_WITH_SSH_FOR_INTERACTIVE_ACCESS'
+            echo 'AFTER_DEMO_LOGIN: python3 .circleci/dualbot_mac_bootstrap_v8.py --verify-only'
+            echo 'NEVER SHARE ACCOUNT PASSWORDS OR ENABLE ALGO TRADING'
+      - store_artifacts:
+          path: verification_reports
+          destination: mac-mt5-gui-readiness
+
+workflows:
+  interactive-mt5-broker-discovery:
+    jobs:
+      - mac-mt5-gui-debug
