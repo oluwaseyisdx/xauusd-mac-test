@@ -1,0 +1,438 @@
+name: DualBot Stage 2 - Deriv DEMO read-only M15 feed (NO TRADES)
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: Original DualBot symbol for M15 read-only verification
+        required: true
+        default: Range Break 200 Index
+        type: choice
+        options:
+          - Range Break 200 Index
+          - Range Break 100 Index
+          - Crash Boom Flip 500 Index
+permissions:
+  contents: read
+concurrency:
+  group: dualbot-stage2-deriv-demo-m15
+  cancel-in-progress: true
+jobs:
+  verify-real-deriv-demo-feed:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Confirm real Apple Silicon macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = 'Darwin'
+          test "$(uname -m)" = 'arm64'
+          echo 'APPLE_SILICON_ARM64=YES'
+      - name: Preflight disposable demo secrets without showing values
+        shell: bash
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+        run: |
+          set -euo pipefail
+          if test -z "${MT5_DEMO_LOGIN:-}" || test -z "${MT5_DEMO_PASSWORD:-}" || test -z "${MT5_DEMO_SERVER:-}"; then
+            echo 'MISSING_DEMO_SECRETS: Configure MT5_DEMO_LOGIN, MT5_DEMO_PASSWORD, MT5_DEMO_SERVER as GitHub Actions repository secrets.'
+            exit 1
+          fi
+          echo 'DISPOSABLE_DEMO_SECRETS_CONFIGURED=YES'
+      - name: Install verified MetaQuotes MT5 Mac package
+        shell: bash
+        timeout-minutes: 16
+        run: |
+          set -euo pipefail
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          cd "$RUNNER_TEMP"
+          downloaded=no
+          for url in \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            'https://download.terminal.free/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip'; do
+            if curl -fLsS --retry 2 --connect-timeout 25 --max-time 240 \
+              --proto '=https' --proto-redir '=https' "$url" -o MetaTrader5.pkg.zip \
+              && test -s MetaTrader5.pkg.zip && unzip -tqq MetaTrader5.pkg.zip; then
+              downloaded=yes
+              break
+            fi
+          done
+          test "$downloaded" = yes
+          mkdir -p "$RUNNER_TEMP/mt5unpack"
+          ditto -x -k MetaTrader5.pkg.zip "$RUNNER_TEMP/mt5unpack"
+          pkg="$(find "$RUNNER_TEMP/mt5unpack" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          pkgutil --check-signature "$pkg" > "$RUNNER_TEMP/mt5_package_signature.txt" 2>&1
+          grep -Eiq 'MetaQuotes' "$RUNNER_TEMP/mt5_package_signature.txt"
+          sudo installer -pkg "$pkg" -target /
+          open -a 'MetaTrader 5' || true
+          prefix="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          ready=no
+          for n in $(seq 1 22); do
+            test -s "$prefix/drive_c/Program Files/MetaTrader 5/terminal64.exe" \
+              && test -s "$prefix/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" \
+              && ready=yes && break
+            open -a 'MetaTrader 5' || true
+            sleep 10
+          done
+          test "$ready" = yes
+          echo 'METAQUOTES_MT5_MAC_READY=YES'
+      - name: Compile safe demo-wait variant of Stage 1 read-only M15 publisher
+        shell: bash
+        timeout-minutes: 6
+        env:
+          EXPECTED_SHA256: a6b75db39511e037c84b8246163fa8b48368a8ab6f217f33a3191039751842b0
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          export WINEDEBUG=-all
+          mkdir -p "$WINEPREFIX/drive_c/DualBotStage2"
+          cat > "$WINEPREFIX/drive_c/DualBotStage2/DualBotMarketFeed.mq5" <<'DUALBOT_STAGE2_SOURCE_EOF'
+          #property strict
+          #property version "1.00"
+          #property description "DualBot private read-only completed M15 candle publisher; demo only; no orders"
+          // Stage 1: Use on one chart per symbol. Does not use any order/trading API.
+          // Two-slot CSV protocol: a complete newer file replaces an older slot; the
+          // Python parser requires both a header and a matching END footer.
+          input int PublishEverySeconds = 15;
+          input int CompletedBars = 420;
+          int write_slot=0;
+
+          string SafeSymbol(const string symbol)
+          {
+             string result="";
+             for(int i=0;i<StringLen(symbol);i++)
+             {
+                ushort c=(ushort)StringGetCharacter(symbol,i);
+                if((c>=48 && c<=57)||(c>=65 && c<=90)||(c>=97 && c<=122))
+                   result+=ShortToString(c);
+                else result+="_";
+             }
+             return result;
+          }
+
+          bool BrokerIsDerivDemo()
+          {
+             if(AccountInfoInteger(ACCOUNT_LOGIN)<=0) return false;
+             if(AccountInfoInteger(ACCOUNT_TRADE_MODE)!=ACCOUNT_TRADE_MODE_DEMO) return false;
+             string company=AccountInfoString(ACCOUNT_COMPANY);
+             string server=AccountInfoString(ACCOUNT_SERVER);
+             return StringFind(company,"Deriv")>=0 || StringFind(server,"Deriv")>=0;
+          }
+
+          void Publish()
+          {
+             if(!BrokerIsDerivDemo()) return;
+             if(!TerminalInfoInteger(TERMINAL_CONNECTED)) return;
+             MqlTick tick;
+             ZeroMemory(tick);
+             if(!SymbolInfoTick(_Symbol,tick) || tick.time<=0 || tick.bid<=0 || tick.ask<=0)
+                return;
+             MqlRates bars[];
+             ArraySetAsSeries(bars,false);
+             int n=CopyRates(_Symbol,PERIOD_M15,1,CompletedBars,bars); // shift 1 excludes forming candle
+             if(n<399) return;
+             string slot=(write_slot%2==0 ? "a" : "b");
+             string filename="dualbot_s1_"+SafeSymbol(_Symbol)+"_M15_"+slot+".csv";
+             int handle=FileOpen(filename,FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ,',');
+             if(handle==INVALID_HANDLE)
+             {
+                Print("DUALBOT_S1_FILE_OPEN_FAILED=",GetLastError());
+                return;
+             }
+             // Header: protocol,symbol,timeframe,count,connected,is_demo,tick_epoch,bid,ask
+             FileWrite(handle,"DB1",_Symbol,"M15",n,1,1,(long)tick.time,
+                       DoubleToString(tick.bid,_Digits),DoubleToString(tick.ask,_Digits));
+             for(int i=0;i<n;i++)
+             {
+                FileWrite(handle,"BAR",(long)bars[i].time,
+                          DoubleToString(bars[i].open,_Digits),
+                          DoubleToString(bars[i].high,_Digits),
+                          DoubleToString(bars[i].low,_Digits),
+                          DoubleToString(bars[i].close,_Digits));
+             }
+             FileWrite(handle,"END",n);
+             FileFlush(handle);
+             FileClose(handle);
+             write_slot++;
+          }
+
+          int OnInit()
+          {
+             if(PublishEverySeconds<5 || PublishEverySeconds>120 || CompletedBars<399 || CompletedBars>1000)
+             {
+                Print("DUALBOT_S1_INVALID_INPUTS");
+                return INIT_PARAMETERS_INCORRECT;
+             }
+             if(!BrokerIsDerivDemo())
+             {
+                Print("DUALBOT_S1_REQUIRES_DERIV_DEMO");
+                return INIT_FAILED;
+             }
+             EventSetTimer(PublishEverySeconds);
+             Publish();
+             Print("DUALBOT_S1_READONLY_STARTED=YES symbol=",_Symbol);
+             return INIT_SUCCEEDED;
+          }
+          void OnTimer() { Publish(); }
+          void OnDeinit(const int reason) { EventKillTimer(); }
+          DUALBOT_STAGE2_SOURCE_EOF
+          python3 - <<'PY_COMPILE'
+          import hashlib,os,re,shutil,subprocess,time
+          from pathlib import Path
+          prefix=Path(os.environ['WINEPREFIX'])
+          source=prefix/'drive_c/DualBotStage2/DualBotMarketFeed.mq5'
+          body=source.read_text(encoding='utf-8')
+          assert hashlib.sha256(source.read_bytes()).hexdigest()==os.environ['EXPECTED_SHA256']
+          # During a first-login startup, the broker may authenticate AFTER OnInit.
+          # Keep the EA alive, but keep Publish() strictly gated to Deriv DEMO.
+          old=("   if(!BrokerIsDerivDemo())\n"
+               "   {\n"
+               '      Print("DUALBOT_S1_REQUIRES_DERIV_DEMO");\n'
+               "      return INIT_FAILED;\n"
+               "   }\n")
+          new=("   if(!BrokerIsDerivDemo())\n"
+               '      Print("DUALBOT_S2_WAITING_FOR_DERIV_DEMO");\n')
+          assert body.count(old)==1
+          source.write_text(body.replace(old,new),encoding='utf-8')
+          body=source.read_text(encoding='utf-8')
+          assert 'if(!BrokerIsDerivDemo()) return;' in body
+          for forbidden in ('OrderSend(', 'CTrade', 'TRADE_ACTION_DEAL', 'WebRequest(', 'SocketCreate('):
+              assert forbidden not in body
+          app=Path('/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin')
+          wine=next((p for p in (app/'wine64',app/'wine') if p.is_file()),None)
+          assert wine is not None
+          exe=source.with_suffix('.ex5'); log=source.with_suffix('.log')
+          for p in (exe,log):p.unlink(missing_ok=True)
+          proc=subprocess.run([str(wine),r'C:\Program Files\MetaTrader 5\metaeditor64.exe',
+             r'/compile:C:\DualBotStage2\DualBotMarketFeed.mq5','/log'],
+             stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=120,env=os.environ.copy())
+          for _ in range(12):
+              if exe.is_file() and log.is_file():break
+              time.sleep(1)
+          raw=log.read_bytes() if log.is_file() else b''
+          output=raw.decode('utf-16le' if raw.count(b'\x00')>len(raw)//8 else 'utf-8',errors='replace')
+          assert exe.is_file() and exe.stat().st_size>=500 and re.search(
+             r'Result:\s*0\s+errors?,\s*0\s+warnings?',output,re.I), 'MQL5 compile did not pass'
+          targets={prefix/'drive_c/Program Files/MetaTrader 5/MQL5/Experts'}
+          for pat in ('drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/*/MQL5/Experts',
+                      'drive_c/users/*/Application Data/MetaQuotes/Terminal/*/MQL5/Experts'):
+              targets.update(prefix.glob(pat))
+          for folder in targets:
+              folder.mkdir(parents=True,exist_ok=True)
+              shutil.copy2(exe,folder/'DualBotMarketFeed.ex5')
+          print('STAGE1_SOURCE_VERIFIED_AND_STAGE2_READONLY_VARIANT_COMPILED=YES')
+          PY_COMPILE
+      - name: Authenticate disposable Deriv demo and verify genuine M15 data in native Python
+        shell: bash
+        timeout-minutes: 9
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+          DERIV_TEST_SYMBOL: ${{ inputs.symbol }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/dualbot_stage2_feed_checker.py" <<'DUALBOT_STAGE2_CHECKER_EOF'
+          #!/usr/bin/env python3
+          """Ephemeral, non-trading Deriv MT5 demo market-data qualification.
+          Never logs accounts, servers, passwords, symbol quotes or private CSVs.
+          """
+          import csv
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import re
+          import signal
+          import subprocess
+          import time
+
+          RESULT = Path('stage2_readonly_result.json')
+          APP = Path('/Applications/MetaTrader 5.app')
+          PREFIX = Path.home() / 'Library/Application Support/net.metaquotes.wine.metatrader5'
+          ROOT = PREFIX / 'drive_c/Program Files/MetaTrader 5'
+          SYMBOL = os.environ.get('DERIV_TEST_SYMBOL', 'Range Break 200 Index')
+          SYMBOLS = ('Range Break 200 Index', 'Range Break 100 Index', 'Crash Boom Flip 500 Index')
+          LOGIN = os.environ.get('MT5_DEMO_LOGIN', '').strip()
+          PASSWORD = os.environ.get('MT5_DEMO_PASSWORD', '')
+          SERVER = os.environ.get('MT5_DEMO_SERVER', '').strip()
+          STATUS = {'test': 'DualBot Stage 2', 'macos_arm64': True,
+                    'target_symbol': SYMBOL, 'live_demo_verified': False,
+                    'complete_fresh_m15_feed': False, 'native_python_read': False,
+                    'original_three_engines_executed': False,
+                    'trade_api_used': False, 'trades_sent': 0,
+                    'outcome': 'NOT_RUN', 'diagnostic_code': 'NOT_STARTED'}
+
+          def finish(code, success=False, **details):
+              STATUS.update(details)
+              STATUS['outcome'] = 'PASS' if success else 'FAIL'
+              STATUS['diagnostic_code'] = code
+              RESULT.write_text(json.dumps(STATUS, indent=2, sort_keys=True) + '\n')
+              print('DUALBOT_STAGE2_SANITIZED_RESULT=' + json.dumps(STATUS, sort_keys=True), flush=True)
+              raise SystemExit(0 if success else 1)
+
+          def valid_credentials():
+              if not (LOGIN and PASSWORD and SERVER):
+                  return False
+              if not LOGIN.isascii() or not LOGIN.isdecimal():
+                  return False
+              if len(LOGIN) > 20 or len(PASSWORD) > 256 or len(SERVER) > 160:
+                  return False
+              if any(c in x for x in (LOGIN, PASSWORD, SERVER) for c in '\n\r\x00'):
+                  return False
+              return True
+
+          def terminal_pids():
+              try:
+                  output = subprocess.check_output(['ps', '-axo', 'pid=,command='], text=True, timeout=10)
+              except (OSError, subprocess.SubprocessError):
+                  return []
+              result=[]
+              for line in output.splitlines():
+                  try:
+                      pid, cmd = line.strip().split(None, 1)
+                      if ('terminal64.exe' in cmd.lower() and
+                          ('wine' in cmd.lower() or 'metatrader' in cmd.lower())):
+                          result.append(int(pid))
+                  except (ValueError, IndexError):
+                      pass
+              return result
+
+          def find_candidate_paths():
+              s = ''.join(c if ('A' <= c <= 'Z' or 'a' <= c <= 'z' or '0' <= c <= '9') else '_'
+                          for c in SYMBOL)
+              names = (f'dualbot_s1_{s}_M15_a.csv', f'dualbot_s1_{s}_M15_b.csv')
+              paths = []
+              for pat in ('drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files',
+                          'drive_c/users/*/Application Data/MetaQuotes/Terminal/Common/Files',
+                          'drive_c/ProgramData/MetaQuotes/Terminal/Common/Files'):
+                  for directory in PREFIX.glob(pat):
+                      for name in names:
+                          p = directory / name
+                          if p.is_file():
+                              paths.append(p)
+              return paths
+
+          def parse_feed(path, now):
+              before = path.stat()
+              if before.st_size <= 0 or before.st_size > 140000:
+                  raise ValueError('INVALID_FILE_SIZE')
+              blob = path.read_bytes()
+              after = path.stat()
+              if before.st_mtime_ns != after.st_mtime_ns or before.st_size != after.st_size:
+                  raise ValueError('FILE_MODIFIED_DURING_READ')
+              if not 0 <= now - after.st_mtime <= 90:
+                  raise ValueError('STALE_FEED_FILE')
+              rows = list(csv.reader(blob.decode('latin-1').splitlines()))
+              if len(rows) < 401:
+                  raise ValueError('INSUFFICIENT_BAR_ROWS')
+              hdr = rows[0]
+              if len(hdr) != 9 or hdr[0] != 'DB1' or hdr[1] != SYMBOL or hdr[2] != 'M15':
+                  raise ValueError('WRONG_FEED_HEADER_OR_SYMBOL')
+              count = int(hdr[3]); connected = int(hdr[4]); demo = int(hdr[5])
+              tick_time = int(hdr[6]); bid = float(hdr[7]); ask = float(hdr[8])
+              if count != len(rows)-2 or count < 399 or count > 1000:
+                  raise ValueError('INVALID_BAR_COUNT')
+              if rows[-1] != ['END', str(count)]:
+                  raise ValueError('INCOMPLETE_FEED_FOOTER')
+              if not (connected == 1 and demo == 1):
+                  raise ValueError('NOT_CONNECTED_TO_DERIV_DEMO')
+              if not (0 <= now - tick_time <= 60 and math.isfinite(bid) and
+                      math.isfinite(ask) and 0 < bid <= ask):
+                  raise ValueError('BAD_OR_STALE_TICK')
+              last=0
+              for r in rows[1:-1]:
+                  if len(r) != 6 or r[0] != 'BAR':
+                      raise ValueError('INVALID_BAR_ROW')
+                  t=int(r[1]); o,h,l,c=(float(x) for x in r[2:6])
+                  if (t % 900 != 0 or t <= last or t+900 > now+5 or
+                      not all(math.isfinite(x) and x > 0 for x in (o,h,l,c)) or
+                      l > min(o,c) or h < max(o,c) or l > h):
+                      raise ValueError('INVALID_BAR_GEOMETRY_OR_TIMESTAMPS')
+                  last=t
+              if now - (last + 900) > 25*60:
+                  raise ValueError('STALE_LAST_COMPLETED_CANDLE')
+              return {'rows': count, 'feed_age_seconds': round(now-after.st_mtime, 1),
+                      'last_bar_within_25_minutes': True}
+
+          def main():
+              if SYMBOL not in SYMBOLS:
+                  finish('SYMBOL_NOT_ALLOWED')
+              if not valid_credentials():
+                  finish('MISSING_OR_INVALID_DEMO_SECRETS')
+              wine_bin = APP / 'Contents/SharedSupport/wine/bin'
+              wine = next((f for f in (wine_bin/'wine64', wine_bin/'wine') if f.is_file()), None)
+              if wine is None or not (ROOT/'terminal64.exe').is_file():
+                  finish('MT5_OR_WINE_NOT_FOUND')
+              if not (ROOT/'MQL5/Experts/DualBotMarketFeed.ex5').is_file():
+                  finish('EA_NOT_INSTALLED')
+              # This disposable GitHub runner must start with a single MT5 process.
+              for pid in terminal_pids():
+                  try: os.kill(pid, signal.SIGTERM)
+                  except (OSError, ValueError): pass
+              time.sleep(5)
+              for pid in terminal_pids():
+                  try: os.kill(pid, signal.SIGKILL)
+                  except (OSError, ValueError): pass
+              time.sleep(2)
+              # Never expose credentials to command arguments or CI output.
+              ini = PREFIX / 'drive_c/dualbot_stage2_private_demo.ini'
+              ini.write_text('[Common]\nLogin='+LOGIN+'\nPassword='+PASSWORD+'\nServer='+SERVER+
+                             '\nKeepPrivate=0\nProxyEnable=0\n'
+                             '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n'
+                             'Account=0\nProfile=0\n'
+                             '[StartUp]\nExpert=DualBotMarketFeed\nSymbol='+SYMBOL+'\nPeriod=M15\n',
+                             encoding='utf-8')
+              ini.chmod(0o600)
+              env = os.environ.copy()
+              for key in ('MT5_DEMO_LOGIN', 'MT5_DEMO_PASSWORD', 'MT5_DEMO_SERVER'):
+                  env.pop(key, None)  # Secrets are already in the private .ini; never pass to Wine processes.
+              env['WINEPREFIX'] = str(PREFIX)
+              env['WINEDEBUG'] = '-all'
+              try:
+                  proc = subprocess.Popen([str(wine), r'C:\Program Files\MetaTrader 5\terminal64.exe',
+                               r'/config:C:\dualbot_stage2_private_demo.ini'], env=env,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+                  seen = False
+                  errors=[]
+                  deadline=time.monotonic()+300
+                  while time.monotonic()<deadline:
+                      seen = seen or bool(terminal_pids())
+                      for path in find_candidate_paths():
+                          try:
+                              parsed = parse_feed(path, time.time())
+                              finish('DERIV_DEMO_M15_FEED_VERIFIED', True, terminal_process_seen=seen,
+                                     live_demo_verified=True, complete_fresh_m15_feed=True,
+                                     native_python_read=True, completed_m15_bars=parsed['rows'],
+                                     fresh_quote_confirmed=True,
+                                     **{'last_bar_within_25_minutes': True})
+                          except (OSError, ValueError, UnicodeError, csv.Error, OverflowError) as exc:
+                              err = str(exc)
+                              if not re.fullmatch(r'[A-Z_]{4,64}', err):
+                                  err = type(exc).__name__
+                              if err not in errors: errors.append(err)
+                      time.sleep(3)
+                  finish('NO_VALID_FRESH_DERIV_M15_FEED', terminal_process_seen=seen,
+                         observed_file_common=bool(find_candidate_paths()),
+                         sanitized_feed_validation_errors=errors[:6])
+              finally:
+                  ini.unlink(missing_ok=True)
+
+          if __name__ == '__main__':
+              main()
+          DUALBOT_STAGE2_CHECKER_EOF
+          python3 "$RUNNER_TEMP/dualbot_stage2_feed_checker.py"
+      - name: Upload ONLY sanitized boolean/count result; never credentials, journals or candles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUALBOT_STAGE2_DERIV_DEMO_M15_RESULT
+          path: stage2_readonly_result.json
+          retention-days: 3
+          if-no-files-found: warn
