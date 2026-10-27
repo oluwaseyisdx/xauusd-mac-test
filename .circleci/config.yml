@@ -1,0 +1,281 @@
+# DualBot Stage 5R — signed MetaQuotes macOS .pkg TLS-safe recovery; READ ONLY.
+# The previous DMG download failed SSL certificate verification (curl exit 60).
+# Reuse the signed official MetaQuotes PKG that passed earlier macOS checks.
+# This is NOT a separately Deriv-branded binary and does not solve server discovery by itself.
+# Existing MT5_DEMO_* or DERIV_MT5_* demo secrets are reused.
+# The file deliberately does not download untrusted third-party MT5 installers.
+# Does not enable live trading or place orders; tests Mac/Wine integration only.
+version: '2.1'
+jobs:
+  dualbot-stage5-signed-pkg-recovery:
+    macos:
+      xcode: 16.4.0
+    resource_class: m4pro.medium
+    working_directory: ~/project
+    environment:
+      PYTHONUNBUFFERED: '1'
+    steps:
+    - checkout: {}
+    - run:
+        name: Confirm Apple Silicon and reuse existing DEMO-only secrets
+        command: |-
+          set -euo pipefail
+          test "$(uname -s)" = 'Darwin'
+          test "$(uname -m)" = 'arm64'
+          echo 'APPLE_SILICON_ARM64=YES'
+          # Do not emit the credentials. Old and new CircleCI naming conventions both work.
+          login="${MT5_DEMO_LOGIN:-${DERIV_MT5_LOGIN:-}}"
+          password="${MT5_DEMO_PASSWORD:-${DERIV_MT5_PASSWORD:-}}"
+          server="${MT5_DEMO_SERVER:-${DERIV_MT5_SERVER:-}}"
+          test -n "$login" && test -n "$password" && test -n "$server" || {
+            echo 'DEMO_SECRETS_NOT_CONFIGURED_IN_CIRCLECI'
+            exit 2
+          }
+          echo 'DEMO_SECRETS_CONFIGURED=YES; BROKER_LOGIN_NOT_YET_VERIFIED'
+    - run:
+        name: Install signed official MT5 Mac PKG via previously tested secure source
+        command: |-
+          set -euo pipefail
+          mkdir -p "$HOME/dualbot-stage5" "$HOME/dualbot-stage5/unpacked"
+          cd "$HOME/dualbot-stage5"
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          # Earlier CircleCI/GitHub Apple Silicon workflows installed the MetaQuotes
+          # signed PKG successfully. The DMG used in the last run produced curl 60.
+          # NEVER use curl -k/--insecure to bypass TLS certificate verification.
+          good=no
+          for url in \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            'https://download.terminal.free/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip'; do
+            echo 'OFFICIAL_METAQUOTES_PKG_DOWNLOAD_ATTEMPT=YES'
+            if curl --fail --location --silent --show-error --retry 2 --connect-timeout 25 --max-time 360 \
+               --proto '=https' --proto-redir '=https' "$url" -o MetaTrader5.pkg.zip \
+               && test -s MetaTrader5.pkg.zip && unzip -tqq MetaTrader5.pkg.zip; then
+              good=yes
+              break
+            fi
+            rm -f MetaTrader5.pkg.zip
+          done
+          if test "$good" != yes; then
+            echo 'OFFICIAL_METAQUOTES_PKG_TLS_DOWNLOAD_FAILED; NO_INSECURE_FALLBACK'
+            exit 60
+          fi
+          ditto -x -k MetaTrader5.pkg.zip unpacked
+          pkg="$(find "$PWD/unpacked" -name '*.pkg' -print -quit)"
+          test -n "$pkg" || { echo 'METAQUOTES_PKG_NOT_FOUND'; exit 2; }
+          pkgutil --check-signature "$pkg" > "$PWD/pkg_signature_private.log" 2>&1 || {
+            echo 'METAQUOTES_PKG_SIGNATURE_INVALID'
+            exit 2
+          }
+          grep -Eiq 'MetaQuotes' "$PWD/pkg_signature_private.log" || {
+            echo 'METAQUOTES_PKG_SIGNER_MISMATCH'
+            exit 2
+          }
+          sudo installer -pkg "$pkg" -target /
+          echo 'SIGNED_METAQUOTES_MAC_PKG_INSTALLED=YES'
+          open -a 'MetaTrader 5' || true
+          python3 - \<<'PY'
+          import os,json,time
+          from pathlib import Path
+          app=Path('/Applications/MetaTrader 5.app')
+          prefix=Path.home()/'Library/Application Support/net.metaquotes.wine.metatrader5'
+          root=prefix/'drive_c/Program Files/MetaTrader 5'
+          wine_dir=app/'Contents/SharedSupport/wine/bin'
+          ready=None
+          for i in range(30):
+              wine=next((x for x in (wine_dir/'wine64',wine_dir/'wine') if x.is_file()),None)
+              terminal=root/'terminal64.exe'
+              editor=root/'metaeditor64.exe'
+              if wine and terminal.is_file() and editor.is_file():
+                  ready=dict(prefix=str(prefix),terminal=str(terminal),editor=str(editor),wine=str(wine),app=str(app))
+                  break
+              os.system("open -a 'MetaTrader 5' >/dev/null 2>&1")
+              time.sleep(8)
+          if not ready:raise SystemExit('METAQUOTES_MAC_INSTALL_MISSING_WINE_OR_TERMINAL')
+          Path.home().joinpath('dualbot-stage5','mt5_paths.json').write_text(json.dumps(ready))
+          print('MT5_WINE_AND_METAEDITOR_READY=YES')
+          PY
+        no_output_timeout: 15m
+    - run:
+        name: Compile read-only broker diagnostic and check Deriv demo connection
+        command: |-
+          set -euo pipefail
+          mkdir -p "$HOME/dualbot-stage5"
+          cat > "$HOME/dualbot-stage5/BrokerProbe.mq5" \<<'STAGE5_MQL'
+          #property strict
+          #property version "1.00"
+          #property description "Stage5 readonly demo connectivity diagnostic; no trades"
+          #define TEST_ID "__RUN_ID__"
+          #define TEST_SYMBOL "Range Break 200 Index"
+          int seq=0;
+          bool IsDeriv()
+          {
+           string a=AccountInfoString(ACCOUNT_COMPANY);
+           string b=AccountInfoString(ACCOUNT_SERVER);
+           StringToLower(a);StringToLower(b);
+           return StringFind(a,"deriv")>=0 || StringFind(b,"deriv")>=0;
+          }
+          void WriteProbe()
+          {
+           seq++;
+           bool connected=(bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+           bool demo=(AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_DEMO);
+           bool deriv=IsDeriv();
+           bool exists=false;
+           bool custom=false;
+           exists=SymbolExist(TEST_SYMBOL,custom);
+           bool selected=false, recent=false;
+           int bars=0;
+           if(connected && demo && deriv && exists)
+           {
+              selected=SymbolSelect(TEST_SYMBOL,true);
+              if(selected)
+              {
+                 MqlTick t; ZeroMemory(t);
+                 recent=SymbolInfoTick(TEST_SYMBOL,t) && t.time>0 && t.bid>0 && t.ask>0
+                    && MathAbs((long)TimeTradeServer()-(long)t.time)<=90;
+                 MqlRates rates[];
+                 int n=CopyRates(TEST_SYMBOL,PERIOD_M15,1,420,rates);
+                 bars=n>0?n:0;
+              }
+           }
+           int h=FileOpen("dualbot_stage5_status.csv",FILE_WRITE|FILE_CSV|FILE_COMMON|FILE_ANSI|FILE_SHARE_READ,';');
+           if(h==INVALID_HANDLE)return;
+           FileWrite(h,TEST_ID,seq,(int)connected,(int)demo,(int)deriv,
+             (int)(AccountInfoInteger(ACCOUNT_LOGIN)>0),(int)exists,(int)selected,(int)recent,bars);
+           FileClose(h);
+          }
+          int OnInit(){EventSetTimer(4);WriteProbe();return INIT_SUCCEEDED;}
+          void OnTimer(){WriteProbe();}
+          void OnDeinit(const int reason){EventKillTimer();}
+          STAGE5_MQL
+          cat > "$HOME/dualbot-stage5/probe.py" \<<'STAGE5_PY'
+          """Stage 5: official Deriv-linked generic MT5 DMG, read-only. No secrets logged."""
+          import os,subprocess,shutil,signal,json,datetime,time,csv,re
+          from pathlib import Path
+          BASE=Path.home()/'dualbot-stage5'
+          META=json.loads((BASE/'mt5_paths.json').read_text())
+          P=Path(META['prefix']); ROOT=Path(META['terminal']).parent
+          WINE=META['wine']; EDITOR=Path(META['editor']); TERMINAL=Path(META['terminal'])
+          RUN=os.environ['CIRCLE_WORKFLOW_ID']
+          LOGIN=os.environ.get('MT5_DEMO_LOGIN') or os.environ.get('DERIV_MT5_LOGIN','')
+          PASSWORD=os.environ.get('MT5_DEMO_PASSWORD') or os.environ.get('DERIV_MT5_PASSWORD','')
+          SERVER=os.environ.get('MT5_DEMO_SERVER') or os.environ.get('DERIV_MT5_SERVER','')
+          RESULT=Path('dualbot_stage5_broker_report.json')
+          report={'test':'Stage 5 - Deriv-linked official Mac MT5 DMG','platform':'macos-arm64',
+            'official_installer_signed':True, 'server_is_alias':('.' not in SERVER and ':' not in SERVER),
+            'demo_secrets_present':bool(LOGIN and PASSWORD and SERVER),'trades_sent':0,
+            'bridge_attached':False,'heartbeat_advanced':False,'terminal_process_seen':False,
+            'deriv_demo_authenticated':False,'connected':False,'demo':False,'deriv':False,
+            'symbol_exists':False,'symbol_selected':False,'quote_recent':False,'completed_m15_bars':0,
+            'diag':'NOT_RUN'}
+          config=P/'drive_c/dualbot5_private.ini'
+          source=P/'drive_c/DualBotStage5/BrokerProbe.mq5'
+          source.parent.mkdir(parents=True,exist_ok=True)
+          source.write_text((BASE/'BrokerProbe.mq5').read_text().replace('__RUN_ID__',RUN),encoding='utf-8')
+
+          def windows_path(path):
+              return 'C:\\'+'\\'.join(path.relative_to(P/'drive_c').parts)
+
+          def candidate_files():
+              patterns=[
+                'drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files/dualbot_stage5_status.csv',
+                'drive_c/users/*/Application Data/MetaQuotes/Terminal/Common/Files/dualbot_stage5_status.csv',
+                'drive_c/ProgramData/MetaQuotes/Terminal/Common/Files/dualbot_stage5_status.csv']
+              return [p for pat in patterns for p in P.glob(pat)]
+
+          def parse(p):
+              try:
+                  if time.time()-p.stat().st_mtime>30:return None
+                  r=list(csv.reader(p.read_text(encoding='latin-1').splitlines(),delimiter=';'))
+                  if len(r)!=1 or len(r[0])!=10 or r[0][0]!=RUN:return None
+                  v=[int(x) for x in r[0][1:]]
+                  return dict(seq=v[0],connected=bool(v[1]),demo=bool(v[2]),deriv=bool(v[3]),
+                      account=bool(v[4]),symbol_exists=bool(v[5]),symbol_selected=bool(v[6]),
+                      quote_recent=bool(v[7]),bars=v[8])
+              except (OSError,ValueError,UnicodeError,csv.Error):return None
+
+          try:
+              if not LOGIN.isascii() or not LOGIN.isdecimal() or not PASSWORD or not SERVER or any(x in a for a in (LOGIN,PASSWORD,SERVER) for x in '\r\n\x00'):
+                  report['diag']='INVALID_DEMO_CONFIGURATION'
+                  raise RuntimeError('invalid demo config')
+              env=os.environ.copy()
+              for k in ('MT5_DEMO_LOGIN','MT5_DEMO_PASSWORD','MT5_DEMO_SERVER','DERIV_MT5_LOGIN',
+                        'DERIV_MT5_PASSWORD','DERIV_MT5_SERVER','DERIV_MT5_MAC_INSTALLER_URL'):
+                  env.pop(k,None)
+              env['WINEPREFIX']=str(P);env['WINEDEBUG']='-all'
+              for tok in ('OrderSend(','CTrade','TRADE_ACTION_DEAL','OrderCheck('):
+                  assert tok not in source.read_text(), 'Unsafe MQL5 source'
+              compiler=subprocess.run([WINE,windows_path(EDITOR),'/compile:'+windows_path(source),'/log'],
+                    env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=140)
+              compiled=source.with_suffix('.ex5'); log=source.with_suffix('.log')
+              for i in range(15):
+                  if compiled.is_file() and log.is_file():break
+                  time.sleep(1)
+              raw=log.read_bytes() if log.is_file() else b''
+              message=raw.decode('utf-16le' if raw.count(b'\x00')>len(raw)//8 else 'utf-8',errors='replace')
+              report['ea_compiled']=bool(compiled.is_file() and compiled.stat().st_size>=500 and
+                     re.search(r'Result:\s*0\s+errors?,\s*0\s+warnings?',message,re.I))
+              if not report['ea_compiled']:
+                  report['diag']='BROKER_METAEDITOR_COMPILE_FAILED'
+                  raise RuntimeError('compiler failure')
+              targets={ROOT/'MQL5/Experts'}
+              for pat in ('drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/*/MQL5/Experts',
+                          'drive_c/users/*/Application Data/MetaQuotes/Terminal/*/MQL5/Experts'):
+                  targets.update(P.glob(pat))
+              for d in targets:
+                  d.mkdir(parents=True,exist_ok=True);shutil.copy2(compiled,d/compiled.name)
+              # Save the account only in this disposable runner's private Wine prefix.
+              config.write_text('[Common]\nLogin='+LOGIN+'\nPassword='+PASSWORD+'\nServer='+SERVER+
+                 '\nKeepPrivate=0\nProxyEnable=0\n[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n'+
+                 'Account=0\nProfile=0\n[StartUp]\nExpert=BrokerProbe\nSymbol=EURUSD\nPeriod=M15\n',encoding='utf-8')
+              config.chmod(0o600)
+              process=subprocess.Popen([WINE,windows_path(TERMINAL),'/config:'+windows_path(config)],
+                        env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+              seen=set()
+              deadline=time.monotonic()+155
+              while time.monotonic()<deadline:
+                  if process.poll() is None:report['terminal_process_seen']=True
+                  for p in candidate_files():
+                      s=parse(p)
+                      if not s:continue
+                      report['bridge_attached']=True
+                      seen.add(s['seq']); report['heartbeat_advanced']=len(seen)>1
+                      report.update(connected=s['connected'],demo=s['demo'],deriv=s['deriv'],
+                             symbol_exists=s['symbol_exists'],symbol_selected=s['symbol_selected'],
+                             quote_recent=s['quote_recent'],completed_m15_bars=s['bars'])
+                      report['deriv_demo_authenticated']=bool(s['connected'] and s['demo'] and s['deriv'] and s['account'])
+                      if report['deriv_demo_authenticated'] and s['bars']>=399 and s['quote_recent']:
+                          report['diag']='DERIV_LINKED_DMG_DEMO_FEED_VERIFIED'
+                          break
+                  if report['diag']=='DERIV_LINKED_DMG_DEMO_FEED_VERIFIED':break
+                  time.sleep(3)
+              if report['diag']=='NOT_RUN':
+                  if not report['terminal_process_seen']:report['diag']='TERMINAL_NOT_STARTED'
+                  elif not report['bridge_attached']:report['diag']='EA_NOT_ATTACHED_OR_FILE_COMMON_MISSING'
+                  elif not report['heartbeat_advanced']:report['diag']='EA_HEARTBEAT_NOT_ADVANCED'
+                  elif not report['connected']:report['diag']='MT5_BROKER_NOT_CONNECTED'
+                  elif not report['deriv_demo_authenticated']:report['diag']='NOT_AUTHENTICATED_DERIV_DEMO'
+                  elif not report['symbol_exists']:report['diag']='TARGET_SYMBOL_NOT_FOUND'
+                  else:report['diag']='M15_DATA_NOT_READY'
+          except (RuntimeError,subprocess.TimeoutExpired) as e:
+              if report['diag']=='NOT_RUN':report['diag']='BROKER_BOOTSTRAP_EXCEPTION'
+              report['exception_kind']=type(e).__name__
+          finally:
+              config.unlink(missing_ok=True)
+              RESULT.write_text(json.dumps(report,sort_keys=True,indent=2)+'\n',encoding='utf-8')
+              print('DUALBOT_STAGE5_SAFE_REPORT='+json.dumps(report,sort_keys=True))
+          STAGE5_PY
+          python3 "$HOME/dualbot-stage5/probe.py"
+        no_output_timeout: 7m
+    - store_artifacts:
+        path: dualbot_stage5_preflight.json
+        destination: dualbot-stage5/preflight
+    - store_artifacts:
+        path: dualbot_stage5_broker_report.json
+        destination: dualbot-stage5/connection
+workflows:
+  stage5-signed-pkg-recovery:
+    jobs:
+    - dualbot-stage5-signed-pkg-recovery
