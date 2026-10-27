@@ -1,0 +1,459 @@
+name: DualBot Stage 3 - Deriv demo connection and EA startup diagnostics (NO TRADES)
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: Exact synthetic index to check (no trading)
+        required: true
+        type: choice
+        default: Range Break 200 Index
+        options:
+          - Range Break 200 Index
+          - Range Break 100 Index
+          - Crash Boom Flip 500 Index
+permissions:
+  contents: read
+concurrency:
+  group: dualbot-stage3-readonly-diagnostic
+  cancel-in-progress: true
+jobs:
+  diagnose-mt5:
+    runs-on: macos-15
+    timeout-minutes: 34
+    steps:
+      - name: Confirm real Apple Silicon
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          echo 'REAL_APPLE_SILICON=YES'
+      - name: Verify disposable demo secrets are set (do not reveal values)
+        shell: bash
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+        run: |
+          set -euo pipefail
+          test -n "${MT5_DEMO_LOGIN:-}" && test -n "${MT5_DEMO_PASSWORD:-}" && test -n "${MT5_DEMO_SERVER:-}"
+          echo 'DEMO_SECRETS_PRESENT=YES; AUTHENTICATION_NOT_YET_VERIFIED'
+      - name: Install signed official MetaQuotes MT5 for Mac
+        shell: bash
+        timeout-minutes: 16
+        run: |
+          set -euo pipefail
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          cd "$RUNNER_TEMP"
+          downloaded=no
+          for url in \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            'https://download.terminal.free/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip'; do
+            if curl -fLsS --retry 2 --connect-timeout 25 --max-time 240 \
+               --proto '=https' --proto-redir '=https' "$url" -o MetaTrader5.pkg.zip \
+               && test -s MetaTrader5.pkg.zip && unzip -tqq MetaTrader5.pkg.zip; then
+              downloaded=yes
+              break
+            fi
+          done
+          test "$downloaded" = yes
+          mkdir -p mt5unpack
+          ditto -x -k MetaTrader5.pkg.zip mt5unpack
+          pkg="$(find "$RUNNER_TEMP/mt5unpack" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          pkgutil --check-signature "$pkg" > "$RUNNER_TEMP/mt5_signature_private.txt" 2>&1
+          grep -Eiq 'MetaQuotes' "$RUNNER_TEMP/mt5_signature_private.txt"
+          sudo installer -pkg "$pkg" -target /
+          open -a 'MetaTrader 5' || true
+          prefix="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          ready=no
+          for i in $(seq 1 22); do
+            if test -s "$prefix/drive_c/Program Files/MetaTrader 5/terminal64.exe" \
+              && test -s "$prefix/drive_c/Program Files/MetaTrader 5/metaeditor64.exe"; then
+                ready=yes
+                break
+            fi
+            open -a 'MetaTrader 5' || true
+            sleep 10
+          done
+          test "$ready" = yes
+          echo 'STAGE3_SIGNED_MT5_INSTALL=PASS'
+      - name: Compile read-only diagnostic EA (no order APIs)
+        shell: bash
+        timeout-minutes: 5
+        env:
+          DIAG_SYMBOL: ${{ inputs.symbol }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/DualBotDiag.mq5" <<'DUALBOT_STAGE3_MQL5_EOF'
+          #property strict
+          #property version "1.00"
+          #property description "DualBot Stage 3 read-only broker and chart diagnostics. No orders."
+          #define DUALBOT_RUN "__RUN_ID__"
+          #define DUALBOT_TARGET "__TARGET_SYMBOL__"
+          int g_seq = 0;
+
+          bool contains_deriv(string company, string server)
+          {
+             StringToLower(company);
+             StringToLower(server);
+             return (StringFind(company,"deriv") >= 0 || StringFind(server,"deriv") >= 0);
+          }
+
+          void SendStatus()
+          {
+             g_seq++;
+             bool connected = (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
+             bool account_present = (AccountInfoInteger(ACCOUNT_LOGIN) > 0);
+             bool demo = (AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO);
+             bool deriv = contains_deriv(AccountInfoString(ACCOUNT_COMPANY),AccountInfoString(ACCOUNT_SERVER));
+             int total_symbols = SymbolsTotal(false);
+             int visible_symbols = SymbolsTotal(true);
+             bool custom=false;
+             bool exists=SymbolExist(DUALBOT_TARGET,custom);
+             bool selected=false;
+             if(exists && connected && demo && deriv)
+                selected=SymbolSelect(DUALBOT_TARGET,true);
+
+             MqlTick tick;
+             ZeroMemory(tick);
+             bool tick_found=false;
+             bool tick_recent=false;
+             if(connected && demo && deriv && selected)
+             {
+                tick_found=SymbolInfoTick(DUALBOT_TARGET,tick) && tick.time>0 && tick.bid>0 && tick.ask>0;
+                tick_recent=tick_found && (MathAbs((long)TimeTradeServer()-(long)tick.time) <= 90);
+             }
+             int candles = 0;
+             int rates_error = 0;
+             bool series_sync = false;
+             if(connected && demo && deriv && selected)
+             {
+                MqlRates rates[];
+                ResetLastError();
+                int count=CopyRates(DUALBOT_TARGET,PERIOD_M15,1,420,rates);
+                rates_error=GetLastError();
+                candles=(count>0 ? count : 0);
+                long synced=0;
+                if(SeriesInfoInteger(DUALBOT_TARGET,PERIOD_M15,SERIES_SYNCHRONIZED,synced))
+                   series_sync=(synced != 0);
+             }
+             int file = FileOpen("dualbot_stage3_status.csv",
+                FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE,';');
+             if(file==INVALID_HANDLE)
+             {
+                Print("DUALBOT_STAGE3_FILE_OPEN_FAILED code=",GetLastError());
+                return;
+             }
+             // No account number, server name, password, symbol prices or historical candles are written.
+             FileWrite(file,DUALBOT_RUN,g_seq,(int)connected,(int)account_present,
+                (int)demo,(int)deriv,total_symbols,visible_symbols,(int)exists,
+                (int)selected,(int)tick_found,(int)tick_recent,candles,
+                (int)series_sync,rates_error,(long)TimeLocal());
+             FileClose(file);
+          }
+          int OnInit()
+          {
+             EventSetTimer(3);
+             SendStatus();
+             Print("DUALBOT_STAGE3_PROBE_STARTED");
+             return INIT_SUCCEEDED;
+          }
+          void OnTimer() { SendStatus(); }
+          void OnDeinit(const int reason) { EventKillTimer(); }
+          DUALBOT_STAGE3_MQL5_EOF
+          cat > "$RUNNER_TEMP/compile_stage3.py" <<'DUALBOT_STAGE3_COMPILE_EOF'
+          import json, os, re, shutil, subprocess, time
+          from pathlib import Path
+
+          root = Path.home() / 'Library/Application Support/net.metaquotes.wine.metatrader5'
+          app = Path('/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin')
+          wine = next((p for p in (app/'wine64', app/'wine') if p.is_file()), None)
+          if wine is None:
+              raise SystemExit('NO_WINE_LOADER')
+          source = root/'drive_c/DualBotStage3/DualBotDiag.mq5'
+          source.parent.mkdir(parents=True,exist_ok=True)
+          text = Path(os.environ['RUNNER_TEMP'],'DualBotDiag.mq5').read_text()
+          run = os.environ['GITHUB_RUN_ID']
+          target = os.environ['DIAG_SYMBOL']
+          if target not in ('Range Break 200 Index','Range Break 100 Index','Crash Boom Flip 500 Index'):
+              raise SystemExit('UNEXPECTED_SYMBOL')
+          text=text.replace('__RUN_ID__',run).replace('__TARGET_SYMBOL__',target)
+          assert all(f not in text for f in ('OrderSend(', 'CTrade', 'TRADE_ACTION_DEAL','OrderCheck(','WebRequest('))
+          source.write_text(text,encoding='ascii')
+          exe = source.with_suffix('.ex5')
+          log = source.with_suffix('.log')
+          for f in (exe,log):f.unlink(missing_ok=True)
+          env=os.environ.copy()
+          env['WINEPREFIX']=str(root)
+          env['WINEDEBUG']='-all'
+          try:
+              proc=subprocess.run([str(wine),r'C:\Program Files\MetaTrader 5\metaeditor64.exe',
+                   r'/compile:C:\DualBotStage3\DualBotDiag.mq5','/log'], env=env,
+                   stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=130)
+          except subprocess.TimeoutExpired:
+              raise SystemExit('METAEDITOR_COMPILE_TIMED_OUT')
+          for _ in range(12):
+              if log.exists() and exe.exists():break
+              time.sleep(1)
+          raw=log.read_bytes() if log.exists() else b''
+          message=raw.decode('utf-16le' if raw.count(b'\x00')>len(raw)//8 else 'utf-8',errors='replace')
+          compiled = exe.exists() and exe.stat().st_size>=500 and bool(re.search(
+               r'Result:\s*0\s+errors?,\s*0\s+warnings?',message,re.I))
+          if not compiled:
+              # Do not print raw compiler logs from user machines.
+              print('COMPILED_EX5_PRESENT=',exe.exists())
+              print('COMPILER_LOG_PRESENT=',log.exists())
+              print('COMPILER_ZERO_ERRORS=',bool(re.search(r'Result:\s*0\s+errors?',message,re.I)))
+              raise SystemExit('MQL5_DIAGNOSTIC_EA_COMPILE_FAILED')
+          # Probe is independent of broker login; installs to the correct terminal data folders.
+          dirs={root/'drive_c/Program Files/MetaTrader 5/MQL5/Experts'}
+          for pat in ('drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/*/MQL5/Experts',
+                      'drive_c/users/*/Application Data/MetaQuotes/Terminal/*/MQL5/Experts'):
+              dirs.update(root.glob(pat))
+          for dest in dirs:
+              dest.mkdir(parents=True,exist_ok=True)
+              shutil.copy2(exe,dest/'DualBotDiag.ex5')
+          print('READONLY_DIAG_EA_COMPILED_AND_INSTALLED=YES')
+          print('DIAGNOSTIC_EXPERT_DESTINATIONS=',len(dirs))
+          DUALBOT_STAGE3_COMPILE_EOF
+          python3 "$RUNNER_TEMP/compile_stage3.py"
+      - name: Diagnose demo authorization, EA startup, exact symbol and native Mac feed
+        shell: bash
+        timeout-minutes: 7
+        env:
+          MT5_DEMO_LOGIN: ${{ secrets.MT5_DEMO_LOGIN }}
+          MT5_DEMO_PASSWORD: ${{ secrets.MT5_DEMO_PASSWORD }}
+          MT5_DEMO_SERVER: ${{ secrets.MT5_DEMO_SERVER }}
+          DIAG_SYMBOL: ${{ inputs.symbol }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/check_stage3.py" <<'DUALBOT_STAGE3_PY_EOF'
+          """Stage 3: sanitized, read-only MT5 diagnostic with no credential output."""
+          import csv, json, os, re, signal, subprocess, time
+          from pathlib import Path
+
+          P=Path.home()/'Library/Application Support/net.metaquotes.wine.metatrader5'
+          ROOT=P/'drive_c/Program Files/MetaTrader 5'
+          WINE_DIR=Path('/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin')
+          WINE=next((p for p in (WINE_DIR/'wine64',WINE_DIR/'wine') if p.is_file()),None)
+          RESULT=Path('dualbot_stage3_result.json')
+          TARGET=os.environ['DIAG_SYMBOL']
+          RUN=os.environ['GITHUB_RUN_ID']
+          LOGIN=os.getenv('MT5_DEMO_LOGIN','')
+          PASSWORD=os.getenv('MT5_DEMO_PASSWORD','')
+          SERVER=os.getenv('MT5_DEMO_SERVER','')
+
+          report={
+            'test':'DualBot Stage 3 - read-only diagnosis',
+            'platform':'macos-15-arm64', 'no_trades':True, 'credentials_configured':bool(LOGIN and PASSWORD and SERVER),
+            'target_instrument':TARGET,'mql5_compiled':True,
+            'control_chart':'EURUSD', 'control':{}, 'fallback':{},
+            'ea_initialized':False,'file_common_seen':False,'heartbeat_advanced':False,
+            'terminal_process_seen':False,'broker_connected':False,'account_present':False,
+            'demo_account':False,'deriv_brand':False,'exact_symbol_exists':False,
+            'symbol_selected':False,'recent_quote':False,'m15_completed_bars':0,
+            'diagnosis':'NOT_STARTED','authenticated_deriv_demo':False,
+            'm15_data_qualified':False,'original_engines_executed':False,
+          }
+
+          def write_report():
+              RESULT.write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+              print('DUALBOT_STAGE3_SANITIZED_RESULT='+json.dumps(report,sort_keys=True),flush=True)
+
+          def terminal_pids():
+              try:
+                  data=subprocess.check_output(['ps','-axo','pid=,command='],text=True,timeout=10)
+              except (OSError,subprocess.SubprocessError):return []
+              found=[]
+              for l in data.splitlines():
+                  try: pid,cmd=l.strip().split(None,1)
+                  except ValueError:continue
+                  c=cmd.lower()
+                  if 'terminal64.exe' in c and ('wine' in c or 'metatrader' in c):
+                      try:found.append(int(pid))
+                      except ValueError:pass
+              return list(dict.fromkeys(found))
+
+          def stop_terminal():
+              for pid in terminal_pids():
+                  try:os.kill(pid,signal.SIGTERM)
+                  except OSError:pass
+              for _ in range(6):
+                  if not terminal_pids():break
+                  time.sleep(1)
+              for pid in terminal_pids():
+                  try:os.kill(pid,signal.SIGKILL)
+                  except OSError:pass
+              time.sleep(2)
+
+          def probe_paths():
+              pats=('drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files/dualbot_stage3_status.csv',
+                    'drive_c/users/*/Application Data/MetaQuotes/Terminal/Common/Files/dualbot_stage3_status.csv',
+                    'drive_c/ProgramData/MetaQuotes/Terminal/Common/Files/dualbot_stage3_status.csv')
+              return sorted(set(p for pat in pats for p in P.glob(pat)))
+
+          def safe_snapshot(path):
+              try:
+                  st=path.stat()
+                  if st.st_size>4096 or st.st_size<1 or time.time()-st.st_mtime>35:return None
+                  rows=list(csv.reader(path.read_text(encoding='latin-1').splitlines(),delimiter=';'))
+                  if not rows:return None
+                  r=rows[-1]
+                  if len(r)!=16 or r[0]!=RUN:return None
+                  nums=[int(s) for s in r[1:]]
+                  if nums[0]<1 or nums[-1]<=0:return None
+                  # Run-specific, non-secret booleans/counts only.
+                  return dict(seq=nums[0],connected=bool(nums[1]),account=bool(nums[2]),
+                      demo=bool(nums[3]),deriv=bool(nums[4]),all_symbols=max(nums[5],0),
+                      marketwatch_symbols=max(nums[6],0),symbol_exists=bool(nums[7]),
+                      symbol_selected=bool(nums[8]),tick_found=bool(nums[9]),
+                      tick_recent=bool(nums[10]),candles=max(nums[11],0),
+                      series_sync=bool(nums[12]),rates_error=nums[13])
+              except (ValueError, OSError, UnicodeError, csv.Error, OverflowError):return None
+
+          def journal_flags(start):
+              # Read MT5 private logs but upload ONLY booleans; never print or retain raw logs.
+              patterns=('drive_c/Program Files/MetaTrader 5/logs/*.log',
+                        'drive_c/Program Files/MetaTrader 5/MQL5/Logs/*.log',
+                        'drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/*/logs/*.log',
+                        'drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/*/MQL5/Logs/*.log',
+                        'drive_c/users/*/Application Data/MetaQuotes/Terminal/*/logs/*.log',
+                        'drive_c/users/*/Application Data/MetaQuotes/Terminal/*/MQL5/Logs/*.log')
+              files=[]
+              for pat in patterns:
+                  files.extend(f for f in P.glob(pat) if f.is_file())
+              files=[f for f in files if f.stat().st_mtime>=start-10][:40]
+              found={'recent_journal_files':len(files),'journal_reports_old_version':False,
+                     'journal_reports_auth_failure':False, 'journal_reports_network_failure':False,
+                     'journal_reports_expert_load_failure':False,
+                     'journal_mentions_diagnostic_ea':False,'journal_reports_symbol_failure':False}
+              terms={
+                'journal_reports_old_version':('old version','obsolete version'),
+                'journal_reports_auth_failure':('authorization failed','invalid password','invalid account','login failed','account invalid'),
+                'journal_reports_network_failure':('no connection','network failed','connection failed','server unavailable','server not found'),
+                'journal_reports_expert_load_failure':('cannot load expert','failed to load expert','expert initialization failed','initialization failed'),
+                'journal_mentions_diagnostic_ea':('dualbotdiag','dualbot_stage3_probe_started'),
+                'journal_reports_symbol_failure':('unknown symbol','symbol not found','invalid symbol')
+              }
+              for f in files:
+                  try:
+                      b=f.read_bytes()[-100000:]
+                      for enc in ('utf-8','utf-16le'):
+                          s=b.decode(enc,errors='replace').lower()
+                          for key,phrases in terms.items():
+                              found[key] |= any(t in s for t in phrases)
+                  except OSError:pass
+              return found
+
+          def run_chart(chart,seconds):
+              status={'chart':chart,'terminal_process_seen':False,'file_common_seen':False,
+                      'ea_initialized':False,'heartbeat_advanced':False}
+              stop_terminal()
+              for f in probe_paths():
+                  try:f.unlink()
+                  except OSError:pass
+              ini=P/'drive_c/dualbot_stage3_private.ini'
+              if any(c in v for v in (LOGIN,PASSWORD,SERVER) for c in '\r\n\0'):
+                  status['preflight']='UNSAFE_DEMO_FIELDS';return status
+              if not LOGIN.isascii() or not LOGIN.isdecimal():
+                  status['preflight']='INVALID_DEMO_LOGIN_FORMAT';return status
+              ini.write_text('[Common]\nLogin='+LOGIN+'\nPassword='+PASSWORD+'\nServer='+SERVER+
+                   '\nKeepPrivate=0\nProxyEnable=0\n'
+                   '[Experts]\nEnabled=1\nAllowLiveTrading=0\nAllowDllImport=0\n'
+                   'Account=0\nProfile=0\n'
+                   '[StartUp]\nExpert=DualBotDiag\nSymbol='+chart+'\nPeriod=M15\n',encoding='utf-8')
+              ini.chmod(0o600)
+              start=time.time()
+              env=os.environ.copy()
+              for key in ('MT5_DEMO_LOGIN','MT5_DEMO_PASSWORD','MT5_DEMO_SERVER'):env.pop(key,None)
+              env['WINEPREFIX']=str(P);env['WINEDEBUG']='-all'
+              try:
+                  subprocess.Popen([str(WINE),r'C:\Program Files\MetaTrader 5\terminal64.exe',
+                      r'/config:C:\dualbot_stage3_private.ini'],env=env,
+                      stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+                  seen=[]
+                  until=time.monotonic()+seconds
+                  while time.monotonic()<until:
+                      status['terminal_process_seen'] |= bool(terminal_pids())
+                      for f in probe_paths():
+                          snapshot=safe_snapshot(f)
+                          if snapshot:
+                              status['file_common_seen']=True
+                              status['ea_initialized']=True
+                              if snapshot['seq'] not in seen:seen.append(snapshot['seq'])
+                              status['heartbeat_advanced']=len(seen)>=2
+                              status['snapshot']=snapshot
+                              if snapshot['connected'] and snapshot['demo'] and snapshot['deriv'] and snapshot['candles']>=399 and snapshot['tick_recent'] and status['heartbeat_advanced']:
+                                  break
+                      if status.get('snapshot',{}).get('candles',0)>=399 and status.get('snapshot',{}).get('tick_recent') and status['heartbeat_advanced']:
+                          break
+                      time.sleep(3)
+                  status.update(journal_flags(start))
+              finally:
+                  ini.unlink(missing_ok=True)
+              return status
+
+          try:
+              if WINE is None or not (ROOT/'terminal64.exe').is_file():
+                  report['diagnosis']='MT5_OR_WINE_MISSING'
+              elif not (LOGIN and PASSWORD and SERVER):
+                  report['diagnosis']='DEMO_SECRETS_MISSING'
+              else:
+                  control=run_chart('EURUSD',90)
+                  report['control']=control
+                  chosen=control
+                  if not control.get('ea_initialized',False):
+                      fallback=run_chart(TARGET,90)
+                      report['fallback']=fallback
+                      if fallback.get('ea_initialized',False):chosen=fallback
+                  report['terminal_process_seen']=bool(control.get('terminal_process_seen') or report['fallback'].get('terminal_process_seen'))
+                  report['file_common_seen']=bool(chosen.get('file_common_seen',False))
+                  report['ea_initialized']=bool(chosen.get('ea_initialized',False))
+                  report['heartbeat_advanced']=bool(chosen.get('heartbeat_advanced',False))
+                  x=chosen.get('snapshot',{})
+                  if x:
+                      report.update(broker_connected=x['connected'],account_present=x['account'],
+                         demo_account=x['demo'],deriv_brand=x['deriv'],exact_symbol_exists=x['symbol_exists'],
+                         symbol_selected=x['symbol_selected'],recent_quote=x['tick_recent'],
+                         m15_completed_bars=x['candles'])
+                  good=report['broker_connected'] and report['account_present'] and report['demo_account'] and report['deriv_brand']
+                  report['authenticated_deriv_demo']=bool(good)
+                  report['m15_data_qualified']=bool(good and report['heartbeat_advanced'] and report['symbol_selected'] and report['recent_quote'] and report['m15_completed_bars']>=399)
+                  if report['m15_data_qualified']:
+                      report['diagnosis']='READONLY_DERIV_M15_VERIFIED'
+                  elif not report['terminal_process_seen']:
+                      report['diagnosis']='TERMINAL_DID_NOT_START'
+                  elif not report['ea_initialized']:
+                      report['diagnosis']='EA_NOT_ATTACHED_OR_FILE_COMMON_MISSING'
+                  elif not report['heartbeat_advanced']:
+                      report['diagnosis']='HEARTBEAT_DID_NOT_ADVANCE'
+                  elif not report['broker_connected']:
+                      report['diagnosis']='BROKER_CONNECTION_NOT_ESTABLISHED'
+                  elif not report['account_present'] or not report['demo_account']:
+                      report['diagnosis']='NO_AUTHENTICATED_DEMO_ACCOUNT'
+                  elif not report['deriv_brand']:
+                      report['diagnosis']='ACCOUNT_NOT_RECOGNIZED_AS_DERIV'
+                  elif not report['exact_symbol_exists']:
+                      report['diagnosis']='EXACT_REQUESTED_SYMBOL_NOT_FOUND'
+                  elif not report['symbol_selected']:
+                      report['diagnosis']='REQUESTED_SYMBOL_NOT_SELECTABLE'
+                  elif not report['recent_quote']:
+                      report['diagnosis']='NO_RECENT_TARGET_SYMBOL_TICK'
+                  else:
+                      report['diagnosis']='M15_HISTORY_NOT_READY'
+          finally:
+              write_report()
+              stop_terminal()
+          DUALBOT_STAGE3_PY_EOF
+          python3 "$RUNNER_TEMP/check_stage3.py"
+      - name: Upload sanitized result only (NO passwords, raw journals, candle prices)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUALBOT_STAGE3_DIAGNOSTICS
+          path: dualbot_stage3_result.json
+          retention-days: 3
+          if-no-files-found: warn
