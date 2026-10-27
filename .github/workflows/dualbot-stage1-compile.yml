@@ -1,0 +1,213 @@
+name: DualBot Stage 1 - Apple Silicon MQL5 read-only compile
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/dualbot-stage1-compile.yml
+permissions:
+  contents: read
+jobs:
+  compile-mql5:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Confirm Apple Silicon ARM64 (M1 runner)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          echo 'REAL_APPLE_SILICON_RUNNER=YES'
+          sw_vers
+      - name: Install official MetaTrader 5 for Mac and bundled Wine
+        shell: bash
+        timeout-minutes: 16
+        run: |
+          set -euo pipefail
+          if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          cd "$RUNNER_TEMP"
+          success=no
+          for url in \
+            'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+            'https://download.terminal.free/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip'; do
+            if curl --fail --location --silent --show-error --retry 2 --connect-timeout 25 --max-time 240 \
+                    --proto '=https' --proto-redir '=https' "$url" -o MetaTrader5.pkg.zip \
+                && test -s MetaTrader5.pkg.zip && unzip -tqq MetaTrader5.pkg.zip; then
+              success=yes
+              break
+            fi
+          done
+          test "$success" = yes
+          mkdir -p mt5unpack
+          ditto -x -k MetaTrader5.pkg.zip mt5unpack
+          pkg="$(find "$RUNNER_TEMP/mt5unpack" -name '*.pkg' -print -quit)"
+          test -n "$pkg"
+          pkgutil --check-signature "$pkg" > "$RUNNER_TEMP/mt5_package_signature.txt" 2>&1
+          grep -Eiq 'MetaQuotes' "$RUNNER_TEMP/mt5_package_signature.txt"
+          sudo installer -pkg "$pkg" -target /
+          open -a 'MetaTrader 5' || true
+          prefix="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          ready=no
+          for n in $(seq 1 18); do
+            test -s "$prefix/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" && ready=yes && break
+            open -a 'MetaTrader 5' || true
+            sleep 10
+          done
+          test "$ready" = yes
+          echo 'OFFICIAL_MT5_MAC_INSTALL=PASS'
+      - name: Compile untouched Stage 1 Deriv DEMO only M15 publisher
+        shell: bash
+        timeout-minutes: 6
+        env:
+          EXPECTED_SHA256: a6b75db39511e037c84b8246163fa8b48368a8ab6f217f33a3191039751842b0
+        run: |
+          set -euo pipefail
+          export WINEPREFIX="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+          export WINEDEBUG=-all
+          mkdir -p "$WINEPREFIX/drive_c/DualBotStage1"
+          cat > "$WINEPREFIX/drive_c/DualBotStage1/DualBotMarketFeed.mq5" <<'DUALBOT_STAGE1_MQL5_EOF'
+          #property strict
+          #property version "1.00"
+          #property description "DualBot private read-only completed M15 candle publisher; demo only; no orders"
+          // Stage 1: Use on one chart per symbol. Does not use any order/trading API.
+          // Two-slot CSV protocol: a complete newer file replaces an older slot; the
+          // Python parser requires both a header and a matching END footer.
+          input int PublishEverySeconds = 15;
+          input int CompletedBars = 420;
+          int write_slot=0;
+          
+          string SafeSymbol(const string symbol)
+          {
+             string result="";
+             for(int i=0;i<StringLen(symbol);i++)
+             {
+                ushort c=(ushort)StringGetCharacter(symbol,i);
+                if((c>=48 && c<=57)||(c>=65 && c<=90)||(c>=97 && c<=122))
+                   result+=ShortToString(c);
+                else result+="_";
+             }
+             return result;
+          }
+          
+          bool BrokerIsDerivDemo()
+          {
+             if(AccountInfoInteger(ACCOUNT_LOGIN)<=0) return false;
+             if(AccountInfoInteger(ACCOUNT_TRADE_MODE)!=ACCOUNT_TRADE_MODE_DEMO) return false;
+             string company=AccountInfoString(ACCOUNT_COMPANY);
+             string server=AccountInfoString(ACCOUNT_SERVER);
+             return StringFind(company,"Deriv")>=0 || StringFind(server,"Deriv")>=0;
+          }
+          
+          void Publish()
+          {
+             if(!BrokerIsDerivDemo()) return;
+             if(!TerminalInfoInteger(TERMINAL_CONNECTED)) return;
+             MqlTick tick;
+             ZeroMemory(tick);
+             if(!SymbolInfoTick(_Symbol,tick) || tick.time<=0 || tick.bid<=0 || tick.ask<=0)
+                return;
+             MqlRates bars[];
+             ArraySetAsSeries(bars,false);
+             int n=CopyRates(_Symbol,PERIOD_M15,1,CompletedBars,bars); // shift 1 excludes forming candle
+             if(n<399) return;
+             string slot=(write_slot%2==0 ? "a" : "b");
+             string filename="dualbot_s1_"+SafeSymbol(_Symbol)+"_M15_"+slot+".csv";
+             int handle=FileOpen(filename,FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ,',');
+             if(handle==INVALID_HANDLE)
+             {
+                Print("DUALBOT_S1_FILE_OPEN_FAILED=",GetLastError());
+                return;
+             }
+             // Header: protocol,symbol,timeframe,count,connected,is_demo,tick_epoch,bid,ask
+             FileWrite(handle,"DB1",_Symbol,"M15",n,1,1,(long)tick.time,
+                       DoubleToString(tick.bid,_Digits),DoubleToString(tick.ask,_Digits));
+             for(int i=0;i<n;i++)
+             {
+                FileWrite(handle,"BAR",(long)bars[i].time,
+                          DoubleToString(bars[i].open,_Digits),
+                          DoubleToString(bars[i].high,_Digits),
+                          DoubleToString(bars[i].low,_Digits),
+                          DoubleToString(bars[i].close,_Digits));
+             }
+             FileWrite(handle,"END",n);
+             FileFlush(handle);
+             FileClose(handle);
+             write_slot++;
+          }
+          
+          int OnInit()
+          {
+             if(PublishEverySeconds<5 || PublishEverySeconds>120 || CompletedBars<399 || CompletedBars>1000)
+             {
+                Print("DUALBOT_S1_INVALID_INPUTS");
+                return INIT_PARAMETERS_INCORRECT;
+             }
+             if(!BrokerIsDerivDemo())
+             {
+                Print("DUALBOT_S1_REQUIRES_DERIV_DEMO");
+                return INIT_FAILED;
+             }
+             EventSetTimer(PublishEverySeconds);
+             Publish();
+             Print("DUALBOT_S1_READONLY_STARTED=YES symbol=",_Symbol);
+             return INIT_SUCCEEDED;
+          }
+          void OnTimer() { Publish(); }
+          void OnDeinit(const int reason) { EventKillTimer(); }
+          DUALBOT_STAGE1_MQL5_EOF
+          python3 - <<'PY_VALIDATION'
+          import hashlib,json,os,re,subprocess,time
+          from pathlib import Path
+          prefix=Path(os.environ['WINEPREFIX'])
+          source=prefix/'drive_c/DualBotStage1/DualBotMarketFeed.mq5'
+          expected=os.environ['EXPECTED_SHA256']
+          assert hashlib.sha256(source.read_bytes()).hexdigest()==expected,'MQL5 source changed'
+          body=source.read_text(encoding='utf-8')
+          for forbidden in ('OrderSend(', 'CTrade', 'TRADE_ACTION_DEAL', 'WebRequest(', 'SocketCreate('):
+              assert forbidden not in body, 'Trading/network capability present'
+          assert 'ACCOUNT_TRADE_MODE_DEMO' in body and 'BrokerIsDerivDemo' in body
+          app=Path('/Applications/MetaTrader 5.app/Contents/SharedSupport/wine/bin')
+          wine=next((p for p in (app/'wine64',app/'wine') if p.is_file()),None)
+          if not wine: raise RuntimeError('Wine 10 or Wine 11 executable not found')
+          executable=r'C:\Program Files\MetaTrader 5\metaeditor64.exe'
+          src=r'C:\DualBotStage1\DualBotMarketFeed.mq5'
+          ex5=source.with_suffix('.ex5')
+          log=source.with_suffix('.log')
+          for candidate in (ex5,log): candidate.unlink(missing_ok=True)
+          result={'platform':'macos-15-arm64','official_installer_signature':'MetaQuotes',
+                  'stage1_source_sha256_match':True,'orders_sent':0,
+                  'live_broker_login':'NOT_TESTED','live_quotes':'NOT_TESTED',
+                  'complete_five_engine_bot':'NOT_TESTED',
+                  'mql5_compile':'FAIL','ex5_present':False}
+          proc=subprocess.run([str(wine),executable,'/compile:'+src,'/log'],
+              stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+              timeout=120,env=os.environ.copy())
+          for _ in range(10):
+              if ex5.is_file() and log.is_file():break
+              time.sleep(1)
+          raw=log.read_bytes() if log.is_file() else b''
+          messages=raw.decode('utf-16le' if raw.count(b'\x00')>len(raw)//8 else 'utf-8',errors='replace')
+          clean=bool(re.search(r'Result:\s*0\s+errors?,\s*0\s+warnings?',messages,re.I))
+          result['compiler_process_exit_code']=proc.returncode
+          result['compiler_log_present']=log.is_file()
+          result['compiler_zero_errors_warnings']=clean
+          result['ex5_present']=ex5.is_file() and ex5.stat().st_size>=500
+          result['ex5_bytes']=ex5.stat().st_size if ex5.is_file() else 0
+          result['mql5_compile']='PASS' if clean and result['ex5_present'] else 'FAIL'
+          Path('stage1_compile_report.json').write_text(json.dumps(result,indent=2)+'\n')
+          print('STAGE1_SAFE_REPORT='+json.dumps(result,sort_keys=True))
+          if result['mql5_compile']!='PASS':
+              for line in messages.splitlines()[-15:]:
+                  print('MQL5_DIAGNOSTIC='+re.sub(r'[A-Za-z]:\\[^\s]+','<path>',line)[:220])
+              raise SystemExit('Stage 1 MQL5 compilation is NOT verified')
+          PY_VALIDATION
+      - name: Upload compiler result (no accounts, no bot code)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUALBOT_STAGE1_MAC_COMPILE_RESULT
+          path: stage1_compile_report.json
+          retention-days: 7
+          if-no-files-found: warn
