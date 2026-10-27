@@ -1,0 +1,100 @@
+# DualBot Stage 7B: combined VNC + official MT5 installation on Apple Silicon.
+# Stage 7A proved that VNC works on its own. 7B puts VNC BEFORE installing MT5.
+# Only disposable Deriv DEMO accounts may be used interactively after SSH/VNC access.
+# NO login secrets in this file; NO Expert Advisor or order API; NO trades.
+version: 2.1
+orbs:
+  macos: circleci/macos@2.5.4
+jobs:
+  dualbot-stage7b-mt5-vnc-ready:
+    macos:
+      xcode: "16.4.0"
+    resource_class: m4pro.medium
+    working_directory: ~/project
+    steps:
+      - checkout
+      - run:
+          name: Check genuine Apple Silicon and private VNC password
+          command: |
+            set -euo pipefail
+            test "$(uname -s)" = Darwin
+            test "$(uname -m)" = arm64
+            test -n "${MAC_VNC_PASSWORD:-}" || { echo 'MAC_VNC_PASSWORD_MISSING'; exit 2; }
+            echo 'S7B_ARM64_AND_VNC_PREFLIGHT=PASS'
+      - macos/enable-vnc:
+          username: vncuser
+          password: MAC_VNC_PASSWORD
+      - run:
+          name: Check VNC service before installing MT5
+          command: |
+            set -euo pipefail
+            echo 'S7B_VNC_ORB_RETURNED=YES'
+            id vncuser >/dev/null
+            echo 'S7B_VNC_USER_EXISTS=YES'
+      - run:
+          name: Install official signed MetaQuotes MT5 Mac PKG (TLS verified)
+          no_output_timeout: 14m
+          command: |
+            set -euo pipefail
+            test "$(uname -m)" = arm64
+            if ! pkgutil --pkg-info com.apple.pkg.RosettaUpdateAuto >/dev/null 2>&1; then
+              sudo softwareupdate --install-rosetta --agree-to-license
+            fi
+            stage="$HOME/dualbot-stage7b"
+            mkdir -p "$stage/unpacked"
+            ok=no
+            for url in \
+              'https://download.terminal.free/cdn/web/metaquotes.ltd/mt5/MetaTrader5.pkg.zip' \
+              'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip' \
+              'https://download.terminal.free/cdn/web/metaquotes.software.corp/mt5/MetaTrader5.pkg.zip'; do
+              host="${url#https://}"
+              host="${host%%/*}"
+              echo "S7B_ATTEMPT_OFFICIAL_HOST=$host"
+              rm -f "$stage/MetaTrader5.pkg.zip"
+              if curl --fail --location --silent --show-error --retry 1 \
+                --connect-timeout 25 --max-time 300 --proto '=https' --proto-redir '=https' \
+                "$url" -o "$stage/MetaTrader5.pkg.zip" \
+                && test -s "$stage/MetaTrader5.pkg.zip" \
+                && unzip -tqq "$stage/MetaTrader5.pkg.zip"; then
+                echo "S7B_OFFICIAL_ZIP_DOWNLOADED=$host"
+                ok=yes
+                break
+              fi
+            done
+            test "$ok" = yes || { echo 'S7B_OFFICIAL_DOWNLOAD_FAILED_NO_TLS_BYPASS'; exit 3; }
+            ditto -x -k "$stage/MetaTrader5.pkg.zip" "$stage/unpacked"
+            pkg="$(find "$stage/unpacked" -name '*.pkg' -print -quit)"
+            test -n "$pkg" || { echo 'S7B_PKG_NOT_FOUND'; exit 3; }
+            pkgutil --check-signature "$pkg" > "$stage/pkg_signature.txt" 2>&1 || { echo 'S7B_PKG_SIGNATURE_FAILED'; exit 3; }
+            grep -Eiq 'MetaQuotes' "$stage/pkg_signature.txt" || { echo 'S7B_PKG_SIGNER_UNEXPECTED'; exit 3; }
+            sudo installer -pkg "$pkg" -target / >/dev/null
+            echo 'S7B_SIGNED_MT5_INSTALLED=YES'
+      - run:
+          name: First launch and verify MT5 Wine terminal exists
+          no_output_timeout: 8m
+          command: |
+            set -euo pipefail
+            prefix="$HOME/Library/Application Support/net.metaquotes.wine.metatrader5"
+            app='/Applications/MetaTrader 5.app'
+            test -d "$app"
+            ready=no
+            for i in $(seq 1 24); do
+              wine_bin="$app/Contents/SharedSupport/wine/bin"
+              if test -s "$prefix/drive_c/Program Files/MetaTrader 5/terminal64.exe" \
+                && test -s "$prefix/drive_c/Program Files/MetaTrader 5/metaeditor64.exe" \
+                && { test -x "$wine_bin/wine64" || test -x "$wine_bin/wine"; }; then
+                ready=yes
+                break
+              fi
+              open -a 'MetaTrader 5' || true
+              sleep 8
+            done
+            test "$ready" = yes || { echo 'S7B_MT5_WINE_FIRST_LAUNCH_NOT_READY'; exit 4; }
+            echo 'S7B_VNC_AND_MT5_COMBINED=PASS'
+            echo 'S7B_NO_BROKER_LOGIN_AUTOMATED=YES'
+            echo 'S7B_NO_ORDER_APIS_OR_TRADES=YES'
+            echo 'S7B_NEXT=RERUN_THIS_SUCCESSFUL_JOB_WITH_SSH_TO_ACCESS_MAC_VNC'
+workflows:
+  stage7b-combined-vnc-and-mt5:
+    jobs:
+      - dualbot-stage7b-mt5-vnc-ready
